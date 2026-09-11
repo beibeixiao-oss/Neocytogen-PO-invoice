@@ -16,7 +16,7 @@ from datetime import datetime
 
 import pdfplumber
 
-__version__ = "2026-09-11.7"
+__version__ = "2026-09-11.9"
 
 # Multiple label spellings for the same field, tried in order
 # The buyer is Neocytogen — any supplier result that extracts to this is wrong

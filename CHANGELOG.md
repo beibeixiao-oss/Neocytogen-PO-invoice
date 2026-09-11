@@ -1,6 +1,40 @@
-# 更新说明 · 2026-09-11.7
+# 更新说明 · 2026-09-11.9
 
 请把整个目录（全部 .py 文件）覆盖，版本号必须一致，否则界面会报「文件版本不一致」。
+
+## 2026-09-11.9：彻底去掉 Needs Review 板块——改成在 matched/discrepancy/No Ledger Match 里直接标黄 + 点开发票
+
+用户提出：Needs Review 完全不需要作为单独板块存在。如果一张发票是 matched，但数据是靠 OCR 读出来的（或者有其他质量问题），就应该直接在 matched 那一条上标黄提醒，并且能在那一条上直接点开发票 PDF 看；discrepancy、No Ledger Match 也一样处理。
+
+### 改了什么
+
+1. **`reconcile.py`**：把原来一次性跑完、单独生成一份「待核查」记录列表的 `flag_suspicious()` 拆掉，改成两个新函数——`_supplier_baseline(expected)`（从台账算出每个供应商的金额/发票号格式基线，`reconcile()` 里只算一次）和 `_quality_reasons(inv, baseline)`（对单张发票现算出"这条抽取结果有没有需要留意的地方"的原因列表，检查项跟原来的 `flag_suspicious()` 完全一样：合计未取到、金额跟供应商历史中位数差十倍以上、发票号格式跟历史不一致、日期未取到、税前+税额算不平、税率异常、由 AI/OCR 识别、供应商未取到）。这个原因列表现在直接挂在每一条 matched/discrepancy/No Ledger Match 记录本身上，是两个新增的字段——`quality_flags`（原因列表，没有问题就是 `None`）和 `source_file`（对应的 PDF 文件名，方便界面提供"打开发票"）——不再是单独一份跟 matched/discrepancy 平行的列表。因为是在每次生成一条记录时现算的，所以能正确反映 OCR 发票号纠正之后的最终状态（纠正在先，判断在后）。`write_output()` 不再接收 `suspicious` 参数，也不再生成「Needs Review」这个 Excel sheet；`reconcile()` 返回的 context 里也不再有 `suspicious` 这个键。
+2. **`app.py`**：整个「Needs Review」UI 板块（包括上一轮刚做的去重逻辑）整段删掉。改动分布在三处：
+   - **matched / 📤 To Import to Xero**（这两个是平铁表格，没法像 discrepancy 那样一条一条展开）：新增 `styled_table()`，用 pandas Styler 把 `quality_flags` 不为空的整行背景标成黄色（跟 Streamlit 原生警告框同色）；表格下面新增一个小工具 `render_pdf_viewer()`——一个下拉框列出所有"有质量问题 + 有对应 PDF"的发票，选中后用 `st.warning()` 显示具体原因，旁边一个「📄 Open invoice PDF」按钮，点一下把对应发票的 PDF 用内嵌 `<iframe>`（base64 data URI）展开/收起。
+   - **discrepancy / No Ledger Match / No Invoice Found / Not Yet Invoiced**（`render_movable_cases()`，本来就是逐张发票一个 `st.expander` 卡片）：如果这一组有质量问题，直接在展开卡片里用 `st.warning(原因)` 显示；如果这张发票的 PDF 也被保存下来了，多一个「📄 View invoice PDF」按钮，点一下同样内嵌展开/收起 PDF。这里特意用「普通按钮 + `st.session_state` 布尔开关」而不是 `st.expander`/`st.popover`，因为 Streamlit 不允许在一个 expander 里再嵌一个 expander（popover 是否允许嵌套也没有把握），这个按钮本身已经在外层的 expander 里了。
+   - 发票 PDF 的原始字节现在会在点击「Run Reconciliation」时顺手存进 `st.session_state["reconciled"]["pdf_bytes"]`（`{文件名: 字节内容}`），因为处理用的临时目录跑完之后就被删掉了，后面界面交互时磁盘上已经找不到那些 PDF 了。`_to_out_rows()` 也做了相应调整，把 `quality_flags`/`source_file` 这两个新字段跟着 OUT_COLS 一起保留下来（不再像原来那样在整理阶段就把这些额外字段丢掉），并且从 discrepancy/No Ledger Match 编辑后点「移到 matched」的时候，也把这两个字段带过去，这样标黄和"打开发票"的能力会跟着发票走，不会因为手动确认一次就消失。
+
+### 测试方法
+
+搭了一个 3 张发票的场景：一张金额跟台账对上但没打印发票日期（进 matched，带 quality flag）；一张金额跟台账不符也没打印日期（进 discrepancy，带 quality flag）；一张台账完全找不到对应记录也没打印日期（进 No Ledger Match，带 quality flag）——三张原因都是「Invoice date not extracted」。用 `streamlit.testing.v1.AppTest` 走一遍真实的「上传 → 点 Run Reconciliation」流程，确认：整页找不到任何"Needs Review"字样；matched/Xero 的下拉选择器能正确列出这张 matched 发票，点「Open invoice PDF」能正确展开内嵌预览；discrepancy 展开卡片里能看到 `st.warning("Invoice date not extracted")` 和「View invoice PDF」按钮，点击后同样能展开；另外单独跑了一遍 `write_output()`，确认导出的 outcome.xlsx 里已经没有「Needs Review」这个 sheet（`sheetnames` 只剩 matched/discrepancy/PDF to Excel - not match/Excel to PDF - not match/Ignored Proformas/pending 六个）。全部 20 项检查通过，`python3 -m py_compile` 确认全部 7 个 .py 文件正常编译。
+
+版本号统一改为 `2026-09-11.9`。
+
+## 2026-09-11.8：Needs Review 去重——已经在 discrepancy / No Ledger Match 里出现的，不再重复显示
+
+用户提出：Needs Review 里的内容如果已经在 discrepancy、No Ledger Match 两个 tab 里出现了，就不用再单独列一遍，用户会在那两个 tab 里处理。
+
+查代码确认：Needs Review（`flag_suspicious()`）跟 discrepancy/No Ledger Match 并不是同一批东西——Needs Review 检查的是"这条抽取结果本身靠不靠谱"（发票号未取到、跟供应商历史金额差十倍以上、发票号格式跟历史不一致、日期未取到、税前+税额算不平、税率异常、由 OCR/AI 识别、供应商未取到），跟"金额有没有对上台账"是两件独立的事。所以有两种情况需要注意：一张发票金额刚好对上台账、进了 matched，但如果是 OCR 识别的或者日期没抽到，仍然会被 Needs Review 标出来提醒复核，这种不应该被去重掉，因为它不会出现在 discrepancy/No Ledger Match 里；反过来，一条真的金额不符的 discrepancy 记录，如果其他信号都正常，本来就不会被 Needs Review 挑出来。
+
+跟用户确认后按"去重后保留"的方案实现：Needs Review 只隐藏那些发票号已经出现在当前 discrepancy 或 No Ledger Match 列表里的条目，不是无条件砍掉整个板块。具体改动在 `app.py`：渲染 Needs Review 之前，先按发票号（用 `excel_loader.normalize_invoice_no` 归一化后比较）算出一个"已经在 discrepancy/No Ledger Match 里出现过"的集合，从待渲染列表里过滤掉这些条目；如果因为过滤全部清空了，会显示"所有被标记的发票都已经在 discrepancy/No Ledger Match 里"，跟"全部通过自动校验、无需复核"区分开来；如果只是部分被过滤，caption 里会注明"另有 N 张已在 discrepancy/No Ledger Match 里显示，此处不重复"。因为这个过滤是基于当前 state 现算的（不是写死的），如果之后用户把一条 discrepancy 记录手动移到了 matched，它对应的发票号就不再在"已出现"集合里，下次重跑时该条如果仍有其他质量问题，会重新出现在 Needs Review 里——这是有意的行为，不是 bug。
+
+「✓ Verified」按钮的移除逻辑不受影响，仍然按对象身份从底层的完整列表里移除，跟这层过滤是否生效无关。
+
+### 测试方法
+
+搭了一组三张发票的场景验证过滤逐条按预期工作：一张金额对上台账（进 matched）但没打印发票日期；一张金额跟台账不符（进 discrepancy）也没打印日期；一张台账里完全找不到对应记录（进 No Ledger Match）也没打印日期——三张都会因为"日期未取到"被 `flag_suspicious()` 标记。用 `streamlit.testing.v1.AppTest` 跑一遍上传 → Run Reconciliation 的完整流程，断言 Needs Review 区域只渲染出第一张（matched 但缺日期），另外两张被正确过滤掉，且 caption 正确提示"另有 2 张已在其他列表显示"。`python3 -m py_compile` 确认全部文件正常编译。
+
+版本号统一改为 `2026-09-11.8`。
 
 ## 2026-09-11.7：彻底清掉了界面上剩下的中文——「待核查」列表、Note、告警文字全部改成英文
 

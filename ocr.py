@@ -18,7 +18,7 @@ import os
 import re
 import shutil
 
-__version__ = "2026-09-11.7"
+__version__ = "2026-09-11.9"
 
 DPI = 300          # Recognition quality drops noticeably below 300; higher gives little benefit and is much slower
 _TESS_OK = None

@@ -8,9 +8,17 @@ Produces four sheets with a shared header (the 12-column template + Source + Not
     discrepancy              present on both sides, amounts don't agree
     PDF to Excel - not match invoice exists, no matching entry in Excel
     Excel to PDF - not match Excel says invoiced, but no matching PDF found
+
+Every row produced from a PDF also carries two extra fields beyond OUT_COLS
+(not written to the Excel export, only used by the UI): "source_file" (the
+original PDF's filename, so the app can offer to open/preview it) and
+"quality_flags" (a list of reasons this invoice's extracted data might not be
+fully trustworthy — e.g. it was OCR-read, or its tax rate looks unusual —
+independent of whether the amount happened to reconcile). See
+quality_flags_by_reasons()/_quality_reasons() below.
 """
 
-__version__ = "2026-09-11.7"
+__version__ = "2026-09-11.9"
 
 import os
 import re
@@ -34,8 +42,9 @@ OUT_COLS = TEMPLATE_COLS + ["Source", "Note"]
 TOLERANCE = 0.05          # Amount tolerance: line-level GST rounding differs by vendor, so we only gate on the invoice total
 
 
-def pdf_rows(inv, source, note=""):
+def pdf_rows(inv, source, note="", quality_flags=None):
     """One invoice -> one row per line item, fields aligned to the template."""
+    extra = {"source_file": inv.get("source_file"), "quality_flags": quality_flags or None}
     rows = []
     for it in inv["line_items"]:
         rows.append({
@@ -53,6 +62,7 @@ def pdf_rows(inv, source, note=""):
             "Amount incl. GST": it["amount_incl"],
             "Source": source,
             "Note": note,
+            **extra,
         })
     if not rows and (inv.get("subtotal") or {}).get("amount_incl") is not None:
         s = inv["subtotal"]
@@ -65,6 +75,7 @@ def pdf_rows(inv, source, note=""):
             "Amount incl. GST": s.get("amount_incl"),
             "Source": source,
             "Note": "; ".join(x for x in [note, "Only the invoice total was extracted, no line items"] if x),
+            **extra,
         })
         return rows
     if not rows:      # Keep a trace even when no line items were extracted, or the invoice would vanish silently
@@ -72,15 +83,17 @@ def pdf_rows(inv, source, note=""):
             "Invoice Number": inv.get("invoice_no"), "PO Number": inv.get("po_no"),
             "Supplier": inv.get("supplier"), "Source": source,
             "Note": (note + " / " if note else "") + "No line items extracted",
+            **extra,
         })
     return rows
 
 
-def merged_rows(inv, grp, note=""):
+def merged_rows(inv, grp, note="", quality_flags=None):
     """A row present on both sides: line-item detail comes from the ledger (Item
     Description is human-written and cleaner than what's scraped from the PDF);
     invoice number / PO / supplier / date / currency come from the PDF (the
     invoice is the basis for payment)."""
+    extra = {"source_file": inv.get("source_file"), "quality_flags": quality_flags or None}
     rows = []
     for _, r in grp.iterrows():
         rows.append({
@@ -98,6 +111,7 @@ def merged_rows(inv, grp, note=""):
             "Amount incl. GST": r["Amount incl. GST"],
             "Source": "Both",
             "Note": note,
+            **extra,
         })
     return rows
 
@@ -160,22 +174,9 @@ def find_candidates(expected, inv, limit=5):
     return rows[:limit]
 
 
-def flag_suspicious(invoices, expected):
-    """Automatically pick out invoices that were "extracted, but might be
-    extracted wrong", ranked by how suspicious they look.
-
-    A field that fails to extract raises an error; a field that extracts to
-    the wrong value doesn't — the latter is the dangerous one. This uses the
-    historical distribution for the same supplier as a baseline: an amount
-    off by an order of magnitude, an invoice-number format that doesn't match
-    its peers, or a date outside a plausible range are all worth a human
-    glance.
-    """
-    import statistics
-    from rapidfuzz import fuzz
-    from excel_loader import normalize_supplier
-
-    # Group ledger amounts and invoice-number shapes by supplier, as a comparison baseline
+def _supplier_baseline(expected):
+    """Group the ledger's amounts and invoice-number shapes by supplier, as a
+    comparison baseline for _quality_reasons()."""
     by_sup = {}
     for _, r in expected.iterrows():
         k = r["supplier_key"]
@@ -189,68 +190,81 @@ def flag_suspicious(invoices, expected):
         if n is not None and not (isinstance(n, float) and pd.isna(n)):
             n = str(int(n)) if isinstance(n, float) and n.is_integer() else str(n).strip()
             by_sup[k]["numbers"].add(n)
+    return by_sup
 
-    out = []
-    for inv in invoices.values():
-        reasons = []
-        sup = normalize_supplier(inv.get("supplier") or "")
-        ref = None
-        for k, v in by_sup.items():
-            if sup and max(fuzz.ratio(sup, k), fuzz.partial_ratio(sup, k)) >= 85:
-                ref = v
-                break
 
-        total = (inv.get("subtotal") or {}).get("amount_incl")
-        if total is None:
-            reasons.append("Invoice total not extracted")
-        elif ref and len(ref["amts"]) >= 3:
-            med = statistics.median(ref["amts"])
-            if med > 0 and (total < med / 10 or total > med * 10):
-                reasons.append(f"Amount {total} is more than 10x off this supplier's median of {round(med, 2)}")
+def _quality_reasons(inv, baseline):
+    """Return the list of reasons this invoice's extracted data might not be
+    fully trustworthy (OCR/AI source, missing date, unusual tax rate, an
+    invoice-number format that doesn't match this supplier's history, etc.).
 
-        shape = _shape(inv.get("invoice_no"))
-        # A Proforma's number follows the supplier's separate numbering scheme (e.g. PI- vs INV-), so a different shape is expected
-        if ref and ref["shapes"] and shape not in ref["shapes"] and not inv.get("is_proforma"):
-            msg = f"Invoice number format {shape} doesn't match this supplier's ledger formats ({'/'.join(sorted(ref['shapes'])[:3])})"
-            fix = suggest_repair(inv.get("invoice_no"), ref.get("numbers", set()))
-            if fix:
-                msg += f"; {fix}"
-            reasons.append(msg)
+    This is independent of whether the amount reconciled — a matched invoice
+    can still come back with reasons here (e.g. it was OCR-read but happened
+    to add up correctly), and a genuine amount mismatch won't show up here at
+    all unless one of these other signals also fired. Called fresh at the
+    point each output row is produced, so it always reflects the invoice's
+    current state (e.g. after an OCR invoice-number correction has already
+    been applied — see the OCR-fold branch in reconcile() below).
 
-        d = inv.get("invoice_date")
-        if d is None:
-            reasons.append("Invoice date not extracted")
+    A field that fails to extract raises an error elsewhere; a field that
+    extracts to the wrong value doesn't — the latter is what this function is
+    for. It uses the historical distribution for the same supplier as a
+    baseline: an amount off by an order of magnitude, an invoice-number format
+    that doesn't match its peers, or a date outside a plausible range are all
+    worth a human glance.
+    """
+    import statistics
+    from rapidfuzz import fuzz
+    from excel_loader import normalize_supplier
 
-        s = inv.get("subtotal") or {}
-        e, g, i = s.get("amount_excl"), s.get("gst"), s.get("amount_incl")
-        if None not in (e, g, i) and abs(e + g - i) > 0.05:
-            reasons.append("excl. GST + GST != incl. GST")
-        if i and e and i > 0 and not (0 <= (i - e) / i < 0.15):
-            reasons.append(f"Unusual tax rate: {round((i - e) / i * 100, 1)}%")
+    reasons = []
+    sup = normalize_supplier(inv.get("supplier") or "")
+    ref = None
+    for k, v in baseline.items():
+        if sup and max(fuzz.ratio(sup, k), fuzz.partial_ratio(sup, k)) >= 85:
+            ref = v
+            break
 
-        if inv.get("ai"):
-            reasons.append("Read by the vision model — figures need manual review")
-        if inv.get("ocr"):
-            reasons.append("Scanned document read via OCR — figures need manual review")
-        # Per the user's request: a Proforma is treated the same as a regular Tax
-        # Invoice and no longer gets pushed into "needs review" just for being a
-        # Proforma — it already takes part in reconciliation normally (see the
-        # README's "About matched and needs-review" section). This just stops
-        # padding the flag count for that one reason; the signals that should
-        # actually surface it are the amount equation, tax rate, and OCR/AI
-        # source — none of which are about whether it's a Proforma.
-        if not inv.get("supplier"):
-            reasons.append("Supplier not extracted")
+    total = (inv.get("subtotal") or {}).get("amount_incl")
+    if total is None:
+        reasons.append("Invoice total not extracted")
+    elif ref and len(ref["amts"]) >= 3:
+        med = statistics.median(ref["amts"])
+        if med > 0 and (total < med / 10 or total > med * 10):
+            reasons.append(f"Amount {total} is more than 10x off this supplier's median of {round(med, 2)}")
 
-        if reasons:
-            out.append({
-                "Invoice No": inv.get("invoice_no"), "Supplier": inv.get("supplier"),
-                "Invoice Date": inv.get("invoice_date"), "Currency": inv.get("currency"),
-                "Total": total, "Flags": len(reasons),
-                "Reason": "; ".join(reasons), "File": inv.get("source_file"),
-            })
-    out.sort(key=lambda r: r["Flags"], reverse=True)
-    return out
+    shape = _shape(inv.get("invoice_no"))
+    # A Proforma's number follows the supplier's separate numbering scheme (e.g. PI- vs INV-), so a different shape is expected
+    if ref and ref["shapes"] and shape not in ref["shapes"] and not inv.get("is_proforma"):
+        msg = f"Invoice number format {shape} doesn't match this supplier's ledger formats ({'/'.join(sorted(ref['shapes'])[:3])})"
+        fix = suggest_repair(inv.get("invoice_no"), ref.get("numbers", set()))
+        if fix:
+            msg += f"; {fix}"
+        reasons.append(msg)
+
+    d = inv.get("invoice_date")
+    if d is None:
+        reasons.append("Invoice date not extracted")
+
+    s = inv.get("subtotal") or {}
+    e, g, i = s.get("amount_excl"), s.get("gst"), s.get("amount_incl")
+    if None not in (e, g, i) and abs(e + g - i) > 0.05:
+        reasons.append("excl. GST + GST != incl. GST")
+    if i and e and i > 0 and not (0 <= (i - e) / i < 0.15):
+        reasons.append(f"Unusual tax rate: {round((i - e) / i * 100, 1)}%")
+
+    if inv.get("ai"):
+        reasons.append("Read by the vision model — figures need manual review")
+    if inv.get("ocr"):
+        reasons.append("Scanned document read via OCR — figures need manual review")
+    # A Proforma is treated the same as a regular Tax Invoice and never flagged
+    # just for being a Proforma — the signals that should actually surface a
+    # problem are the ones above (amount equation, tax rate, OCR/AI source),
+    # none of which are about whether it's a Proforma.
+    if not inv.get("supplier"):
+        reasons.append("Supplier not extracted")
+
+    return reasons
 
 
 # The character pairs OCR confuses most often. Only used to probe "possibly misread" cases — never a blanket text-wide replacement.
@@ -312,6 +326,7 @@ def _shape(v):
 def reconcile(xlsx_path, pdf_source):
     """pdf_source can be a folder path or a list of PDF paths"""
     expected, pending = load_tracking_list(xlsx_path)
+    baseline = _supplier_baseline(expected)
 
     if isinstance(pdf_source, (str, os.PathLike)):
         pdf_files = sorted(glob.glob(os.path.join(pdf_source, "*.pdf")))
@@ -421,13 +436,14 @@ def reconcile(xlsx_path, pdf_source):
         used_po.add(pk)
         gdf = pd.DataFrame(by_po[pk])
         n = len(group)
-        for _, inv in group:
+        for key, inv in group:
             t = (inv.get("subtotal") or {}).get("amount_incl")
             matched.extend(merged_rows(
                 inv, gdf,
                 f"Matched by PO: this PO has {n} invoices issued in batches, "
                 f"total {round(sum((i.get('subtotal') or {}).get('amount_incl') for _, i in group), 2)}"
-                f" agrees with the ledger (this invoice: {t})"))
+                f" agrees with the ledger (this invoice: {t})",
+                quality_flags=_quality_reasons(inv, baseline)))
     _batched = {id(i) for g in batch_ok.values() for _, i in g}
     candidates = [(k, i) for k, i in candidates if id(i) not in _batched]
 
@@ -473,12 +489,14 @@ def reconcile(xlsx_path, pdf_source):
             tag = (f"Paired by nearest amount (all {len(group)} invoices under this PO had no "
                    f"recognizable invoice number, so each was paired to its corresponding ledger "
                    f"row by total amount rather than compared against the whole-group sum)")
+            qf = _quality_reasons(inv, baseline)
             if abs(x_incl - p_incl) <= TOLERANCE:
-                matched.extend(merged_rows(inv, gdf, tag))
+                matched.extend(merged_rows(inv, gdf, tag, quality_flags=qf))
             else:
                 diff = round(p_incl - x_incl, 2)
                 discrepancy.extend(merged_rows(
-                    inv, gdf, "; ".join([tag, f"Amount mismatch: ledger {x_incl} vs invoice {p_incl} (diff {diff})"])))
+                    inv, gdf, "; ".join([tag, f"Amount mismatch: ledger {x_incl} vs invoice {p_incl} (diff {diff})"]),
+                    quality_flags=qf))
             _paired.add(id(inv))
         used_po.add(pk)
     candidates = [(k, i) for k, i in candidates if id(i) not in _paired]
@@ -505,13 +523,13 @@ def reconcile(xlsx_path, pdf_source):
             used_inv.add(real)
             # Previously this only used `real` to look up the matching ledger
             # row — the extraction result itself (inv["invoice_no"]) was never
-            # updated, so outcome.xlsx and "needs review" kept showing the
-            # original OCR-misread number (e.g. LBHOO1): the pairing succeeded
-            # but the displayed number was still wrong, which looked unfixed.
-            # `inv` and the `invoices` dict reference the same object, so
-            # updating it here means flag_suspicious() downstream also sees
-            # the corrected number, and the format check won't falsely flag
-            # "doesn't match the ledger" anymore.
+            # updated, so outcome.xlsx kept showing the original OCR-misread
+            # number (e.g. LBHOO1): the pairing succeeded but the displayed
+            # number was still wrong, which looked unfixed. `inv` and the
+            # `invoices` dict reference the same object, so updating it here
+            # means the quality-flag check further below (which runs after
+            # this) also sees the corrected number, and the format check
+            # won't falsely flag "doesn't match the ledger" anymore.
             n = by_inv[real][0]["Invoice Number"]
             fixed_no = (str(int(n)) if isinstance(n, float) and n.is_integer() else str(n).strip()) if n is not None else None
             if fixed_no and normalize_invoice_no(fixed_no) == real:
@@ -540,11 +558,15 @@ def reconcile(xlsx_path, pdf_source):
                     grp, level = by_po[pk], "PO (every ledger row under this PO is already claimed, please confirm manually)"
                 used_po.add(pk)
 
+        # Computed after any OCR invoice-number correction above, so it
+        # reflects the invoice's final, corrected state.
+        qf = _quality_reasons(inv, baseline)
+
         if grp is None:
             po = str(inv.get("po_no") or "")
             hint = ("PO is from 2025 — please check the 2025 ledger"
                     if re.match(r"PONCG2025", po, re.I) else "No matching PO or invoice number in the ledger")
-            pdf_only.extend(pdf_rows(inv, "PDF", hint))
+            pdf_only.extend(pdf_rows(inv, "PDF", hint, quality_flags=qf))
             continue
 
         gdf = pd.DataFrame(grp)
@@ -555,13 +577,13 @@ def reconcile(xlsx_path, pdf_source):
             tag += " (invoice number not recognized)"
 
         if p_incl is None:
-            discrepancy.extend(merged_rows(inv, gdf, "; ".join(x for x in [tag, "Invoice total not extracted, can't compare amounts"] if x)))
+            discrepancy.extend(merged_rows(inv, gdf, "; ".join(x for x in [tag, "Invoice total not extracted, can't compare amounts"] if x), quality_flags=qf))
         elif abs(x_incl - p_incl) <= TOLERANCE:
-            matched.extend(merged_rows(inv, gdf, tag))
+            matched.extend(merged_rows(inv, gdf, tag, quality_flags=qf))
         else:
             diff = round(p_incl - x_incl, 2)
             note = f"Amount mismatch: ledger {x_incl} vs invoice {p_incl} (diff {diff})"
-            discrepancy.extend(merged_rows(inv, gdf, "; ".join(x for x in [tag, note] if x)))
+            discrepancy.extend(merged_rows(inv, gdf, "; ".join(x for x in [tag, note] if x), quality_flags=qf))
 
     # In the ledger, but no matching PDF was found
     from excel_loader import STATUS_INVOICE_EXPECTED
@@ -575,7 +597,8 @@ def reconcile(xlsx_path, pdf_source):
             excel_only.extend(excel_rows(pd.DataFrame([r]), "Recorded in the ledger, but no matching invoice PDF was found"))
 
     for inv in failed:
-        pdf_only.extend(pdf_rows(inv, "PDF", "Could not extract an invoice number: " + "; ".join(inv["warnings"])))
+        pdf_only.extend(pdf_rows(inv, "PDF", "Could not extract an invoice number: " + "; ".join(inv["warnings"]),
+                                  quality_flags=_quality_reasons(inv, baseline)))
 
     sheets = {
         "matched": matched,
@@ -585,7 +608,6 @@ def reconcile(xlsx_path, pdf_source):
     }
     context = {"expected": expected, "invoices": invoices,
                "superseded": superseded,
-               "suspicious": flag_suspicious(invoices, expected),
                "unmatched_pdf": [i for k, i in invoices.items()
                                  if k not in used_inv
                                  and normalize_invoice_no(i.get("po_no")) not in used_po],
@@ -595,7 +617,7 @@ def reconcile(xlsx_path, pdf_source):
     return sheets, pending, context
 
 
-def write_output(sheets, pending, path, suspicious=None, superseded=None):
+def write_output(sheets, pending, path, superseded=None):
     wb = Workbook()
     wb.remove(wb.active)
     order = ["matched", "discrepancy", "PDF to Excel - not match", "Excel to PDF - not match"]
@@ -626,17 +648,6 @@ def write_output(sheets, pending, path, suspicious=None, superseded=None):
         ws.column_dimensions[L].width = 46 if L in "EF" else 18
     ws.freeze_panes = "A2"
 
-    ws = wb.create_sheet("Needs Review")
-    cols = ["Invoice No", "Supplier", "Invoice Date", "Currency", "Total", "Flags", "Reason", "File"]
-    ws.append(cols)
-    for c in ws[1]:
-        c.font = Font(name="Arial", bold=True)
-    for r in (suspicious or []):
-        ws.append([r.get(c) for c in cols])
-    for n, L in enumerate("ABCDEFGH"):
-        ws.column_dimensions[L].width = 52 if L in "GH" else 16
-    ws.freeze_panes = "A2"
-
     ws = wb.create_sheet("pending (no invoice yet)")
     ws.append(["Invoice Number", "PO Number", "Supplier", "Description", "Unit no",
                "Amount incl. GST", "Status", "Excel row"])
@@ -656,10 +667,9 @@ if __name__ == "__main__":
     xlsx, pdf_dir = sys.argv[1], sys.argv[2]
     out = sys.argv[3] if len(sys.argv) > 3 else "Neocytogen - outcome.xlsx"
     sheets, pending, ctx = reconcile(xlsx, pdf_dir)
-    write_output(sheets, pending, out, ctx["suspicious"], ctx["superseded"])
+    write_output(sheets, pending, out, ctx["superseded"])
     for k, v in sheets.items():
         print(f"{k:28s} {len(v):4d} rows")
     print(f"{'Ignored Proformas':25s} {len(ctx['superseded']):4d}")
-    print(f"{'Needs Review':29s} {len(ctx['suspicious']):4d}")
     print(f"{'pending (not invoiced)':26s} {len(pending):4d} rows")
     print("Written to:", out)

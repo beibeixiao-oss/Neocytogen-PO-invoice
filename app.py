@@ -3,9 +3,10 @@ app.py — Purchase Invoice Reconciliation Tool (UI)
 
     streamlit run app.py
 
-Upload the Procurement Tracking List on one side and the invoice PDF(s) on the
-other (multiple files allowed). Upload one PDF for a single check, or a whole
-month's worth for a batch reconciliation — both paths use the same logic.
+Upload the Procurement Tracking List on one side and the invoice PDF(s) on
+the other (multiple files allowed). Upload one PDF for a single check, or a
+whole month's worth for a batch reconciliation — both paths use the same
+logic.
 
 Interactive editing (since 2026-09-11.5):
     Once a reconciliation run has been computed, the results are stored in
@@ -19,10 +20,30 @@ Interactive editing (since 2026-09-11.5):
     when you download outcome.xlsx, but refreshing the page or re-uploading
     the same files will not remember what you did before (per the user's
     request, there is no cross-session persistence yet).
+
+Data-quality flagging, in place of a standalone review section (since
+2026-09-11.9):
+    There used to be a separate "Needs Review" section listing invoices whose
+    extracted data looked untrustworthy (OCR/AI-read, missing date, unusual
+    tax rate, etc.), on top of the discrepancy / No Ledger Match tabs. Per the
+    user's request that section is gone; instead every row carries this signal
+    inline, wherever it already appears:
+      - matched / Xero import (flat tables, can't have per-row buttons):
+        flagged rows are highlighted yellow via a pandas Styler, and a small
+        picker tool below the table (styled_table + render_pdf_viewer) lets
+        you select one of the flagged invoices and open its PDF inline.
+      - discrepancy / No Ledger Match / No Invoice Found (expander cards):
+        each flagged group shows its reasons via st.warning(...) plus a
+        "View invoice PDF" button that toggles an inline preview — all inside
+        the existing per-invoice expander (render_movable_cases).
+    The underlying reasons and the PDF itself come from reconcile.py's
+    "quality_flags"/"source_file" fields (see that module's docstring) and
+    from pdf_bytes captured into session_state at upload time.
 """
 
-__version__ = "2026-09-11.7"
+__version__ = "2026-09-11.9"
 
+import base64
 import os
 import tempfile
 from io import BytesIO
@@ -45,6 +66,7 @@ from reconcile import reconcile, find_candidates, write_output, OUT_COLS
 
 NUMERIC_COLS = ("Unit no", "Unit Price", "Amount excl. GST", "GST", "Amount incl. GST")
 DATE_COLS = ("Invoice date", "Due Date")
+HIGHLIGHT = "background-color: #fff3b0"          # native Streamlit warning-yellow
 
 
 def _safe_df(rows):
@@ -63,15 +85,98 @@ def show(df, **kw):
     st.dataframe(_safe_df(df), width="stretch", hide_index=True, **kw)
 
 
+def styled_table(rows, **kw):
+    """Like show(), but yellow-highlights rows whose invoice carries a
+    quality flag (OCR/AI-read, unusual tax rate, missing date, etc.) — used
+    for matched and the Xero import list. Those are flat tables and can't
+    have a per-row "view PDF" button the way the expander-based tabs do;
+    render_pdf_viewer() below is the click-to-open counterpart for these two.
+    Expects the raw row dicts (with the extra "quality_flags" field, not yet
+    trimmed to OUT_COLS) — the extra field itself is never displayed."""
+    if not rows:
+        st.write("None")
+        return
+    df = _safe_df(rows)
+    cols = [c for c in OUT_COLS if c in df.columns]
+    disp = df[cols]
+    flagged = df["quality_flags"].map(bool) if "quality_flags" in df.columns else None
+    if flagged is None or not flagged.any():
+        st.dataframe(disp, width="stretch", hide_index=True, **kw)
+        return
+    styler = (disp.style
+              .apply(lambda row: [HIGHLIGHT if flagged.loc[row.name] else "" for _ in row], axis=1)
+              .hide(axis="index"))
+    st.dataframe(styler, width="stretch", **kw)
+
+
+def _render_pdf_inline(data, height=600):
+    b64 = base64.b64encode(data).decode()
+    st.markdown(
+        f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="{height}" '
+        f'style="border:1px solid #ddd" type="application/pdf"></iframe>',
+        unsafe_allow_html=True,
+    )
+
+
+def _flagged_pdf_options(rows, pdf_bytes):
+    """One entry per invoice (line items collapsed) among `rows` that both
+    carries a quality flag and has its original PDF available in pdf_bytes."""
+    opts, seen = [], set()
+    for grp in _group_contiguous(rows):
+        r = grp[0]
+        qf, src = r.get("quality_flags"), r.get("source_file")
+        if not qf or not src or src not in pdf_bytes:
+            continue
+        label = f"{r.get('Invoice Number') or '(number not recognized)'} · {r.get('Supplier')} · {src}"
+        if label in seen:
+            continue
+        seen.add(label)
+        opts.append((label, qf, src))
+    return opts
+
+
+def render_pdf_viewer(rows, state, key_prefix):
+    """Small picker tool for the flat matched/Xero tables: pick a flagged
+    invoice from the dropdown, see why it was flagged, and open its PDF
+    inline — the click-to-open counterpart to styled_table()'s highlighting,
+    for tabs where a per-row button isn't possible."""
+    opts = _flagged_pdf_options(rows, state.get("pdf_bytes") or {})
+    if not opts:
+        return
+    st.caption("Rows highlighted yellow above have a data-quality flag (OCR/AI read, unusual tax "
+               "rate, missing date, etc.) — pick one below to check the original PDF.")
+    labels = [o[0] for o in opts]
+    pick = st.selectbox("Flagged invoice", labels, key=f"{key_prefix}_pick")
+    _, qf, src = next(o for o in opts if o[0] == pick)
+    for reason in qf:
+        st.warning(reason)
+    toggle_key = f"{key_prefix}_pdfopen_{src}"
+    if st.button("📄 Open invoice PDF", key=f"{key_prefix}_openbtn_{src}"):
+        st.session_state[toggle_key] = not st.session_state.get(toggle_key, False)
+    if st.session_state.get(toggle_key):
+        _render_pdf_inline(state["pdf_bytes"][src])
+
+
 def _to_out_rows(rows):
     """Normalize rows from any source (dicts from the sheets, or dicts
     converted from the pending DataFrame) into a clean dict list containing
-    only OUT_COLS, filling any missing field with None. This keeps matched /
+    every OUT_COLS field (filling any missing one with None), plus the extra
+    "quality_flags"/"source_file" fields when present. This keeps matched /
     discrepancy / pdf_only / excel_only / pending in exactly the same shape,
     so the editing, grouping, and move logic below can share one code path
     instead of a separate one for pending's column differences (it originally
-    had no Source/Note)."""
-    return [{c: r.get(c) for c in OUT_COLS} for r in rows]
+    had no Source/Note column). The extra fields are what let the UI
+    highlight a row and offer to open its PDF (see styled_table /
+    render_pdf_viewer / render_movable_cases) — they're dropped again before
+    anything is written to outcome.xlsx."""
+    out = []
+    for r in rows:
+        d = {c: r.get(c) for c in OUT_COLS}
+        for extra in ("quality_flags", "source_file"):
+            if extra in r:
+                d[extra] = r[extra]
+        out.append(d)
+    return out
 
 
 def _ensure_out_cols(r):
@@ -141,19 +246,41 @@ def render_movable_cases(groups, state, source_key, title_fn, note_fn, key_prefi
     with a button; clicking it moves the (possibly edited) content into
     matched as a group, removes it from its original list, tags it with a
     note explaining this was handled manually, and calls st.rerun() to
-    refresh the page."""
+    refresh the page.
+
+    When the group carries a quality flag (see reconcile.py's
+    quality_flags), its reasons are shown via st.warning(...) right in the
+    expander, and — when the underlying PDF was captured — a plain button
+    toggles an inline preview underneath. This intentionally avoids
+    st.expander/st.popover for the toggle: Streamlit doesn't allow nesting
+    either of those inside another expander, and this whole block already
+    renders inside one."""
     if not groups:
         st.write("None")
         return
+    pdf_bytes = state.get("pdf_bytes") or {}
     for gi, grp in enumerate(groups):
         with st.expander(title_fn(grp)):
+            qf = grp[0].get("quality_flags")
+            src = grp[0].get("source_file")
+            for reason in (qf or []):
+                st.warning(reason)
+            if src and src in pdf_bytes:
+                toggle_key = f"{key_prefix}_pdfopen_{gi}"
+                if st.button("📄 View invoice PDF", key=f"{key_prefix}_pdfbtn_{gi}"):
+                    st.session_state[toggle_key] = not st.session_state.get(toggle_key, False)
+                if st.session_state.get(toggle_key):
+                    _render_pdf_inline(pdf_bytes[src])
             edited = st.data_editor(_safe_df(grp)[OUT_COLS], key=f"{key_prefix}_edit_{gi}",
                                      num_rows="fixed", width="stretch")
             if st.button(button_label, key=f"{key_prefix}_move_{gi}"):
                 note = note_fn(grp)
                 new_rows = [_coerce_row(r) for r in edited.to_dict("records")]
-                for r in new_rows:
+                for r, orig in zip(new_rows, grp):
                     r["Note"] = note
+                    for extra in ("quality_flags", "source_file"):
+                        if extra in orig:
+                            r[extra] = orig[extra]
                 state["matched"].extend(new_rows)
                 ids = {id(r) for r in grp}
                 state[source_key] = [r for r in state[source_key] if id(r) not in ids]
@@ -241,11 +368,17 @@ if run_clicked:
         with open(xlsx_path, "wb") as f:
             f.write(xlsx_file.getbuffer())
 
+        # Also keep every PDF's raw bytes in memory (keyed by filename), so
+        # the UI can offer to preview them later — the temp dir itself is
+        # gone by the time the page re-renders on the next interaction.
         pdf_paths = []
+        pdf_bytes_by_name = {}
         for up in pdf_files:
+            data = bytes(up.getbuffer())
+            pdf_bytes_by_name[up.name] = data
             p = os.path.join(tmp, up.name)
             with open(p, "wb") as f:
-                f.write(up.getbuffer())
+                f.write(data)
             pdf_paths.append(p)
 
         with st.spinner(f"Processing {len(pdf_paths)} invoices…"):
@@ -253,7 +386,6 @@ if run_clicked:
 
         # Backward compatible with older reconcile.py: degrade gracefully on
         # missing fields instead of crashing the whole page.
-        ctx.setdefault("suspicious", [])
         ctx.setdefault("superseded", [])
         ctx.setdefault("unmatched_pdf", [])
         ctx.setdefault("failed", [])
@@ -279,7 +411,7 @@ if run_clicked:
             "pdf_only": _to_out_rows(sheets["PDF to Excel - not match"]),
             "excel_only": _to_out_rows(sheets["Excel to PDF - not match"]),
             "pending": pending_rows,
-            "suspicious": list(ctx["suspicious"]),
+            "pdf_bytes": pdf_bytes_by_name,
             "ctx": ctx,
         }
 
@@ -303,7 +435,7 @@ _sheets_now = {
 _pending_now = pd.DataFrame(state["pending"]) if state["pending"] else \
     pd.DataFrame(columns=list(OUT_COLS) + ["_status", "_row"])
 _buf = BytesIO()
-write_output(_sheets_now, _pending_now, _buf, state["suspicious"], ctx.get("superseded"))
+write_output(_sheets_now, _pending_now, _buf, ctx.get("superseded"))
 _buf.seek(0)
 
 m1, m2, m3, m4, m5 = st.columns(5)
@@ -317,34 +449,10 @@ st.download_button("Download outcome.xlsx", _buf,
                    file_name="Neocytogen - outcome.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# Needs review: the program flags and ranks results it thinks look
-# suspicious, so a person doesn't have to open every single one to check.
-# Each one gets a "Verified" button — clicking it just removes it from this
-# list (a manual review checkmark); it doesn't change that invoice's status
-# in matched/discrepancy, it's purely to track "how many are still unreviewed".
 if ctx["superseded"]:
     with st.expander(f"Ignored Proformas ({len(ctx['superseded'])})"):
         st.caption("This PO already has a Tax Invoice, and by rule only the Tax Invoice is counted. Listed here for reference only.")
         show(ctx["superseded"])
-
-susp = state["suspicious"]
-if susp:
-    st.subheader(f"Needs Review · {len(susp)} of {n_inv}")
-    st.caption("Sorted by number of flags. Click \"Verified\" on the right once reviewed to remove it — this doesn't affect the matched/discrepancy determination.")
-    for i, row in enumerate(list(susp)):
-        sc1, sc2 = st.columns([9, 1])
-        with sc1:
-            st.write(f"**{row.get('Invoice No') or '(number not recognized)'}** · {row.get('Supplier')} · "
-                     f"Total {row.get('Total')} · Flags {row.get('Flags')}  \n"
-                     f"{row.get('Reason')}  \n"
-                     f"*{row.get('File')}*")
-        with sc2:
-            if st.button("✓ Verified", key=f"susp_done_{i}"):
-                state["suspicious"] = [r for r in state["suspicious"] if r is not row]
-                st.rerun()
-        st.divider()
-else:
-    st.success(f"All {n_inv} invoices passed automatic validation — no manual review needed.")
 
 # Extraction warnings: fields that couldn't be extracted, line totals that
 # don't add up, etc. — surfaced up front so it's clear which results might
@@ -363,27 +471,27 @@ tab_xero, tab_matched, tab_disc, tab_pdf_only, tab_excel_only, tab_pending = st.
 with tab_xero:
     st.caption("Every matched invoice shows up here automatically — both the ones that matched "
                "automatically and the ones manually confirmed from other tabs. Download this list "
-               "directly to review before importing into Xero.")
-    if state["matched"]:
-        show(pd.DataFrame(state["matched"])[OUT_COLS])
-    else:
-        st.write("No matched invoices yet.")
+               "directly to review before importing into Xero. Rows highlighted yellow have a "
+               "data-quality flag — see the picker below to check the original PDF.")
+    styled_table(state["matched"])
+    render_pdf_viewer(state["matched"], state, key_prefix="xero")
     st.download_button("Download Xero import list", _xero_export(state["matched"]),
                        file_name="To Import to Xero.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        key="xero_download")
 
 with tab_matched:
-    if state["matched"]:
-        show(pd.DataFrame(state["matched"])[OUT_COLS])
-    else:
-        st.write("None")
+    st.caption("Rows highlighted yellow were read by OCR/AI or have another data-quality flag "
+               "worth a second look — use the picker below to open the original PDF.")
+    styled_table(state["matched"])
+    render_pdf_viewer(state["matched"], state, key_prefix="matched")
 
 with tab_disc:
     st.caption("Invoices whose amount doesn't match the ledger. You can edit the content directly "
                "below (e.g. if the ledger itself was wrong, or the invoice's actual amount should "
                "win) — click the button after editing to move the whole invoice to matched (it will "
-               "also appear in To Import to Xero).")
+               "also appear in To Import to Xero). A yellow warning under an invoice's title means "
+               "its extracted data also has a quality flag — open the PDF there to double check.")
     render_movable_cases(
         _group_contiguous(state["discrepancy"]), state, "discrepancy",
         title_fn=lambda grp: (f"Invoice {grp[0].get('Invoice Number') or '(number not recognized)'} · "
