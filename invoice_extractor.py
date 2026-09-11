@@ -14,7 +14,7 @@ from datetime import datetime
 
 import pdfplumber
 
-__version__ = "2026-08-21.14"
+__version__ = "2026-09-11.1"
 
 # 同一字段的多种标签写法，按顺序尝试
 # 买方是 Neocytogen —— 任何抽成这个的供应商结果都是错的
@@ -312,6 +312,13 @@ TOTAL_PATTERNS = {
         r"Add\s*[\d.]+\s*%?\s*GST[^\d\-]{0,12}([\d,]+\.\d{2})",
         r"Tax\s*Amount\s*(?:[\d.]+\s*%)?[^\d\-]{0,12}([\d,]+\.\d{2})",
         r"Total\s*GST\s*(?:Amount)?\s*(?:[\d.]+\s*%)?[^\d\-]{0,12}([\d,]+\.\d{2})",
+        # 坑（调试今天这 5 张时顺带发现，跟 Lonza 那份「税率异常：91.7%」的待核查
+        # 记录对得上号）：这条是全表里最宽松的一条，只要求出现 "GST" 字样。
+        # Lonza 印的是 "TOTAL EXCL. GST 1,176.00" 和 "GST 9% 105.84" 两行，前者排在
+        # 前面，这条不加排除的话会先撞上 "EXCL. GST 1,176.00"，把税前小计当成税额，
+        # 税后总额固定，于是等式反推把税前金额算成 105.84 —— 税率显示成 91.7%，
+        # 正是台账里看到的那条「待核查」记录。加排除后交给等式校验去补 GST。
+        r"(?<!EXCL\. )(?<!EXCL )(?<!EXCLUDING )"
         r"GST\s*(?:@|Amount)?\s*(?:\(?\s*[\d.]+\s*\)?\s*%)?[^\d\-]{0,12}([\d,]+\.\d{2})",
     ],
     "amount_incl": [
@@ -332,6 +339,18 @@ TOTAL_PATTERNS = {
         # 坑：Genomax 印 "Total Discount 0.00"，通用 ^TOTAL 会取到 0.00。
         # 标签里出现 DISCOUNT/EXCL/BEFORE/PAID/UNITS 的都不是应付总额。
         r"^\s*(?<!Sub)(?<!Sub )TOTAL\b(?![^\d\n]{0,20}(?:EXCL|BEFORE|EXCLUDING|DISCOUNT|PAID|UNITS|QTY))[^\d\n\-]{0,40}([\d,]+\.\d{2})\s*$",
+        # 兜底：OCR 把同一横向位置的两栏内容读成了一整行，"Total" 后面直接跟着的不是
+        # 数字而是另一栏文字，等真正的金额出现时前面已经不是行首、后面也没有币种。
+        # 实测 Vazyme 扫描件被读成 "...Singapore Branch Total 279.04"（银行信息那栏
+        # 和金额那栏被拼在了一起）。放在最后一条，排除词沿用上面同一套，避免复发
+        # Lonza/Genomax 那两个坑；也不要求行首/币种，只要求数字紧跟在 Total 后面。
+        # (?<!Sub-) 这条是测试 Sigma 样张时才发现要补的：Sigma 印的是 "Items Sub-Total
+        # 551.70"，Sub 和 Total 中间是连字符而不是无分隔或空格，原来只防了
+        # "Subtotal"/"Sub Total" 两种写法，"Sub-Total" 会从 \bTotal\b 的词边界缝隙里钻
+        # 过去（连字符是非单词字符，Total 前依然算词边界），把行项目小计当成了总额。
+        r"(?<!Sub)(?<!SUB)(?<!Sub )(?<!SUB )(?<!Sub-)(?<!SUB-)(?<!Untaxed )\bTotal\b"
+        r"(?![^\d\n]{0,20}(?:EXCL|BEFORE|EXCLUDING|DISCOUNT|PAID|UNITS|QTY))"
+        r"[ \t:]{0,10}([\d,]+\.\d{2})(?!\s*%)",
     ],
 }
 
@@ -483,6 +502,14 @@ def extract_invoice(path):
         if ocr and ocr.available():
             o_plain, o_layout = ocr.ocr_pdf(path)
             if o_plain.strip():
+                # Tesseract 在部分斜体/紧凑字体下会把印刷体的连字符 "-" 认成波浪号 "~"，
+                # 常见于 "INV-26-03285" 被读成 "INV-26~03285"。发票号正则的字符集只认
+                # \w - /，遇到 ~ 就整个截断，抽出来的号码少了后半截还看不出异常
+                # （valid_invoice_no 照样能过，因为截断后的 "INV-26" 本身形状合法）。
+                # 波浪号在真实发票文本里基本不会出现，数字/字母之间夹一个就判定是连字符误读，
+                # 在正则匹配前先做文本级归一化，比逐个放宽每条正则的字符集更不容易引入副作用。
+                o_plain = re.sub(r"(?<=[0-9A-Za-z])~(?=[0-9A-Za-z])", "-", o_plain)
+                o_layout = re.sub(r"(?<=[0-9A-Za-z])~(?=[0-9A-Za-z])", "-", o_layout)
                 full_text, layout_text = o_plain, o_layout
                 ocr_used = True
                 warnings.append("扫描件，内容由 OCR 识别 —— 数字可能有误，请人工复核")
@@ -614,6 +641,18 @@ def extract_invoice(path):
             subtotal = {**fallback, **{k: v for k, v in (subtotal or {}).items() if v is not None}}
             if not items:
                 warnings.append("未抽到明细行，已按发票合计参与对账")
+
+    # 再兜一层：TOTAL_PATTERNS 全部要求标签和数字在同一行，但「标签在上、值在下
+    # 一行同一列」是发票版式里常见的另一种布局（Sigma 这类系统生成的发票尤其明显：
+    # 一行印 "... TOTAL CURRENCY"，数值在下一行同列 "... 601.35 SGD"）。
+    # 复用 _label_below 的列对齐逻辑去找 TOTAL 标签正下方那个数字。
+    if (subtotal or {}).get("amount_incl") is None:
+        tok = _label_below(layout_text, r"\bTOTAL\b")
+        val = _money(tok)
+        if val is not None and val > 0:
+            subtotal = dict(subtotal or {})
+            subtotal["amount_incl"] = val
+            warnings.append("发票合计取自「TOTAL 标签下一行同列」的版式，请人工确认")
 
     # 校验：行加总 vs 发票合计（行级 GST 有自己的舍入，只在合计层面卡，容差 0.05）
     priced = [i for i in items if i.get("amount_incl") is not None]

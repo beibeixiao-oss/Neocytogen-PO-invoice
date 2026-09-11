@@ -10,7 +10,7 @@ reconcile.py — PDF invoice × Procurement Tracking List 对账主程序
     Excel to PDF - not match Excel 说已开票、但没找到 PDF
 """
 
-__version__ = "2026-08-21.14"
+__version__ = "2026-09-11.1"
 
 import os
 import re
@@ -423,6 +423,19 @@ def reconcile(xlsx_path, pdf_source):
             real = folded[_fold(key)][0]
             grp, level = by_inv[real], f"发票号（OCR 字符纠正：{key} → {real}，请人工确认）"
             used_inv.add(real)
+            # 之前这里只用 real 去台账里取匹配的行，抽取结果本身（inv["invoice_no"]）
+            # 从没改过，导致 outcome.xlsx 和「待核查」里显示的仍是 OCR 读错的原始号码
+            # （比如 LBHOO1），配对成功了但号码本身还是错的，容易被当成没修好。
+            # inv 和 invoices 字典引用的是同一个对象，这里改了后面 flag_suspicious
+            # 用到的也是修正后的号码，格式比对不会再误报「与台账不一致」。
+            n = by_inv[real][0]["Invoice Number"]
+            fixed_no = (str(int(n)) if isinstance(n, float) and n.is_integer() else str(n).strip()) if n is not None else None
+            if fixed_no and normalize_invoice_no(fixed_no) == real:
+                old_no = inv.get("invoice_no")
+                if fixed_no != old_no:
+                    inv["invoice_no"] = fixed_no
+                    inv.setdefault("warnings", []).append(
+                        f"发票号经 OCR 字符纠正：{old_no} → {fixed_no}（依据台账唯一匹配），请人工确认")
         else:
             pk = normalize_invoice_no(inv.get("po_no"))
             if pk in by_po:

@@ -17,7 +17,7 @@ import os
 import re
 import shutil
 
-__version__ = "2026-08-21.14"
+__version__ = "2026-09-11.1"
 
 DPI = 300          # 低于 300 识别率明显下降；再高收益有限且很慢
 _TESS_OK = None
