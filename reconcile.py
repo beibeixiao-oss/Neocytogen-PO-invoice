@@ -10,7 +10,7 @@ reconcile.py — PDF invoice × Procurement Tracking List 对账主程序
     Excel to PDF - not match Excel 说已开票、但没找到 PDF
 """
 
-__version__ = "2026-09-11.1"
+__version__ = "2026-09-11.2"
 
 import os
 import re
@@ -222,8 +222,10 @@ def flag_suspicious(invoices, expected):
             reasons.append("由视觉模型识别，数字需人工复核")
         if inv.get("ocr"):
             reasons.append("扫描件经 OCR 识别，数字需人工复核")
-        if inv.get("is_proforma"):
-            reasons.append("该 PO 目前只有 Proforma，尚无 Tax Invoice")
+        # 按用户要求：Proforma 跟正常 Tax Invoice 一样处理，不再仅因为是 Proforma
+        # 就单独进「待核查」——它本来就正常参与对账（见 README「关于 matched 与
+        # 待核查」），这里只是不再额外拿这一条刷疑点数。真正该被挑出来复核的
+        # 还是金额等式、税率、OCR/AI 来源这些信号，跟是不是 Proforma 无关。
         if not inv.get("supplier"):
             reasons.append("未取到供应商")
 

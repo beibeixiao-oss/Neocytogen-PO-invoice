@@ -8,7 +8,7 @@ excel_loader.py — Neocytogen 采购对账系统 · Excel 侧加载与标准化
     df, pending = load_tracking_list("Neocytogen Procurement Tracking List (2026).xlsx")
 """
 
-__version__ = "2026-09-11.1"
+__version__ = "2026-09-11.2"
 
 import re
 import pandas as pd

@@ -1,8 +1,29 @@
-# 更新说明 · 2026-09-11.1
+# 更新说明 · 2026-09-11.2
 
 请把整个目录（全部 .py 文件）覆盖，版本号必须一致，否则界面会报「文件版本不一致」。
 
 ## 本轮修复
+
+用户又上传了 16 张此前识别有问题的发票（Atlantis Bioscience、Vazyme、Lonza、Newtonoptic、UPS 进口关税单、BioBasic、Afirmus、Axil、Genomax、Acoerela、BioLabs、ThermoFisher、DMEM Atlantis 等），逐张核对后修了 2 类新问题，另外按用户要求调整了 Proforma 的处理方式：
+
+### 1. 正文抓到的 PO 号不是 PONCG 格式时，没有优先信文件名（影响 UPS 进口关税发票）
+
+UPS 的 Import Tax Invoice 里没有真正的「PO」字段，货运明细表里的 "Reference No."（货运公司自己的运单参考号 `5282293306`）被 `po_no` 的通用兜底正则当成了 PO，覆盖掉了本该来自文件名的正确 PO `PONCG202601011`。PONCG 格式本来就是代码里公认「最可靠」的一条规则，现在改成：正文抽到的 PO 不是 PONCG 格式、而文件名给的是合法 PONCG 格式时，优先信文件名，并在 Note 里注明「很可能抓错了字段」。
+
+（顺带确认了同一张发票「税率异常：89.0%」不是 bug——它是进口关税发票，这次账单本来就只收「代缴关税 GST + 一笔小额垫付手续费」，税额占比天然畸高，程序把它标进待核查是对的，不用处理。）
+
+### 2. 原生 PDF 词间没有空格，"TOTAL SGD" 被读成粘连的 "TOTALSGD"（影响 Acoerela）
+
+Acoerela 这张不是扫描件，是 PDF 本身字符间距太紧，pdfplumber 判断不出词间空格，"TOTAL SGD 400.00" 被抽成一整块 "TOTALSGD 400.00"。所有 `\bTOTAL\b` 开头的规则都要求 TOTAL 后面是词边界，"S" 紧跟着没有边界，全部规则都失效，这张之前完全没抽到发票合计。加了一条专门认「TOTAL 紧贴着币种代码」这种粘连写法的规则，不改全局分词阈值（那样风险面太大）。
+
+### 3. 按用户要求：Proforma 不再单独进「待核查」
+
+之前只要 `is_proforma` 为真，`flag_suspicious` 就会加一条「该 PO 目前只有 Proforma，尚无 Tax Invoice」，把发票推进待核查列表——哪怕金额、格式全部正常。Proforma 本来就正常参与对账（见 README），现在不再仅因为是 Proforma 就额外增加疑点，真正该被挑出来复核的还是金额等式、税率、OCR/AI 来源这些信号。「已忽略的 Proforma」那张 sheet（同一 PO 已有 Tax Invoice 时只算 Tax Invoice）不受影响，仍然保留，那是防止同一笔账被算两次，跟这次的调整是两回事。
+
+### 已知但没有改的问题
+
+至少两张发票（`Magnetic stirrer bars, BioLabs` 和 `AgeI, BioBasic`）的供应商名里混进了品名/货号，因为文件名括号里的内容被上传流程处理掉了逗号，无法确认原始分隔符是逗号还是别的写法，没有把握动这条规则，暂时没改。这不影响对账匹配本身（匹配靠发票号/PO，不靠供应商名字符串），只是显示的供应商名不够干净，之后如果方便的话可以把这两张原始文件名核实一下。
+
 
 用户上传了 5 张落在「待核查」里的真实发票（Vazyme×2、Sigma、Atlantis、Newtonoptic），逐张排查后修了四类问题：
 

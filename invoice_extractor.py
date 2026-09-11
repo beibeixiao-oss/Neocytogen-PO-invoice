@@ -14,7 +14,7 @@ from datetime import datetime
 
 import pdfplumber
 
-__version__ = "2026-09-11.1"
+__version__ = "2026-09-11.2"
 
 # 同一字段的多种标签写法，按顺序尝试
 # 买方是 Neocytogen —— 任何抽成这个的供应商结果都是错的
@@ -334,6 +334,14 @@ TOTAL_PATTERNS = {
         # 'Untaxed'（Roylab）同理。
         # 币种可能带括号或冒号："TOTAL (SGD) 305.20"、"TOTAL SGD 453.44"、"TOTAL: SGD 1,234.00"
         r"(?<!Sub)(?<!SUB)(?<!Sub )(?<!SUB )(?<!Untaxed )\bTOTAL\b[^\d\n]{0,10}?\(?\s*(?:SGD|USD|EUR|GBP|JPY)\s*\)?[^\d\-]{0,14}([\d,]+\.\d{2})",
+        # 坑：Acoerela 这类原生 PDF 里 pdfplumber 抽出来的文字词间没有空格
+        # （不是扫描件，是这份 PDF 本身字符间距太紧，pdfplumber 的分词阈值判断不出
+        # 空格），"TOTAL SGD" 被读成粘在一起的 "TOTALSGD"。\bTOTAL\b 要求 TOTAL
+        # 后面是词边界，但紧跟着的 S 也是单词字符，两者之间没有边界，上面所有
+        # \bTOTAL\b 开头的规则全部失效，这张发票之前完全没抽到合计。单独加一条
+        # 只认「TOTAL 紧贴着币种代码」这种粘连写法，不去改分词阈值（那样风险面太大，
+        # 会牵动其他所有字段的抽取）。
+        r"\bTOTAL(?:SGD|USD|EUR|GBP|JPY)\b[^\d\-]{0,14}([\d,]+\.\d{2})",
         # 坑：Lonza 印 "TOTAL EXCL. GST 1,176.00" 与 "TOTAL 1,281.84" 两行，
         # 通用 ^TOTAL 会先撞上前者。标签里出现 EXCL/BEFORE 的一律不是税后额。
         # 坑：Genomax 印 "Total Discount 0.00"，通用 ^TOTAL 会取到 0.00。
@@ -579,7 +587,19 @@ def extract_invoice(path):
     if header.get("po_no") in (None, "") and fn.get("po_no"):
         header["po_no"] = fn["po_no"]
     elif fn.get("po_no") and str(header.get("po_no")) != str(fn["po_no"]):
-        warnings.append(f"PO 号不一致：正文 {header['po_no']} vs 文件名 {fn['po_no']}")
+        # 正文抽到的 PO 不是 PONCG 格式，而文件名是——大概率正文那个根本不是
+        # Neocytogen 自己的 PO，是文档里恰好也叫「Reference No. / PO No」的别的号码。
+        # 实测 UPS 的 Import Tax Invoice：正文没有真正的 PO 字段，货运明细表里的
+        # "Reference No."（货运公司自己的运单参考号 5282293306）被 po_no 的通用
+        # 兜底正则当成了 PO。PONCG 格式本来就是代码里公认「最可靠」的一条，
+        # 文件名给的是这个格式而正文给的不是，就该信文件名。
+        body_po = str(header.get("po_no") or "")
+        fn_po = str(fn["po_no"])
+        if not re.fullmatch(r"PONCG\d{9,}", body_po, re.I) and re.fullmatch(r"PONCG\d{9,}", fn_po, re.I):
+            warnings.append(f"正文 PO 号 {header['po_no']} 不是 PONCG 格式，很可能抓错了字段，已改用文件名里的 {fn_po}")
+            header["po_no"] = fn_po
+        else:
+            warnings.append(f"PO 号不一致：正文 {header['po_no']} vs 文件名 {fn['po_no']}")
 
     if not valid_invoice_no(header.get("invoice_no")) and fn.get("invoice_no_hint"):
         header["invoice_no"] = fn["invoice_no_hint"]
