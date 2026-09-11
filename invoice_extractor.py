@@ -14,7 +14,7 @@ from datetime import datetime
 
 import pdfplumber
 
-__version__ = "2026-09-11.3"
+__version__ = "2026-09-11.5"
 
 # 同一字段的多种标签写法，按顺序尝试
 # 买方是 Neocytogen —— 任何抽成这个的供应商结果都是错的
@@ -34,6 +34,13 @@ LABEL_PATTERNS = {
         r"\bInv(?:oice)?\s*(?:No\.?|#)[ \t]*([A-Za-z0-9][\w\-/]{2,})",
         r"\b(?:Document|Doc)\s*(?:No\.?|Number)[ \t]*[:.#]?[ \t]*([A-Za-z0-9][\w\-/]{2,})",
         r"\bP\.?I\.?\s*(?:NO|No)\.?[ \t]*[:.#]?[ \t]*([A-Za-z0-9][\w\-/]{2,})",
+        # 坑（Roylab）：这份发票的版式是文档标题本身就是标签——"Tax Invoice
+        # INV/2026/0117"，标题后面直接跟发票号，中间没有 "No./Number/#" 这类词，
+        # 上面几条都要求这样的词才会匹配，全部落空。不敢把「Tax Invoice」后面
+        # 任何词都当发票号（很多发票光是标题后面跟的是公司名、地址），所以限定
+        # 紧跟着的词必须长得像发票号：字母开头、中间带一个 - 或 /、后面还有数字，
+        # 排除掉普通单词、地名这些误伤。
+        r"\bTax\s+Invoice\s+([A-Za-z]{2,6}[\-/][\dA-Za-z\-/]{3,})\b",
     ],
     "invoice_date": [
         # Lonza：标签 "Our invoice" 与 "<号> dated <日期>" 被换行拆开，
@@ -306,12 +313,22 @@ TOTAL_PATTERNS = {
         r"Subtotal[^\n]{0,60}?([\d,]+\.\d{2})\s*$",
         r"Subtotal[^\d\-]{0,20}([\d,]+\.\d{2})",
         r"^\s*Total\s*[:：][^\d\-]{0,12}([\d,]+\.\d{2})",
+        # 坑（Roylab，Odoo 生成的发票模板常见叫法）："Untaxed Amount" 才是税前小计。
+        # 上面几条标签（Net Amount / Subtotal）它一个都不用，之前完全没被认出来，
+        # 于是税前金额永远是 None，被后面「税前=税后、GST=0」那条零税率兜底误判成
+        # 零税发票——这张明明是 9% GST。
+        r"Untaxed\s*Amount[^\d\-]{0,14}([\d,]+\.\d{2})",
     ],
     "gst": [
         r"Add\s*GST\s*\(?\s*[\d.]+\s*\)?\s*%[^\d\-]{0,14}([\d,]+\.\d{2})",
         r"Add\s*[\d.]+\s*%?\s*GST[^\d\-]{0,12}([\d,]+\.\d{2})",
         r"Tax\s*Amount\s*(?:[\d.]+\s*%)?[^\d\-]{0,12}([\d,]+\.\d{2})",
         r"Total\s*GST\s*(?:Amount)?\s*(?:[\d.]+\s*%)?[^\d\-]{0,12}([\d,]+\.\d{2})",
+        # 坑（Roylab）：税额小计印的是 "TAX 9% 47.16"，不带 "GST" 字样，上面几条
+        # 全部要求出现 GST 都对不上。行项目里倒是有一堆 "Sales Tax S$ 247.50"，
+        # 但那是单行税额、后面没有紧跟百分比，不会被这条误伤——这条要求 "TAX"
+        # 后面立刻跟一个百分号数字（"TAX 9%"），是发票底部汇总行的固定写法。
+        r"\bTAX\s*[\d.]+\s*%[^\d\-]{0,14}([\d,]+\.\d{2})",
         # 坑（调试今天这 5 张时顺带发现，跟 Lonza 那份「税率异常：91.7%」的待核查
         # 记录对得上号）：这条是全表里最宽松的一条，只要求出现 "GST" 字样。
         # Lonza 印的是 "TOTAL EXCL. GST 1,176.00" 和 "GST 9% 105.84" 两行，前者排在
@@ -346,7 +363,12 @@ TOTAL_PATTERNS = {
         # 通用 ^TOTAL 会先撞上前者。标签里出现 EXCL/BEFORE 的一律不是税后额。
         # 坑：Genomax 印 "Total Discount 0.00"，通用 ^TOTAL 会取到 0.00。
         # 标签里出现 DISCOUNT/EXCL/BEFORE/PAID/UNITS 的都不是应付总额。
-        r"^\s*(?<!Sub)(?<!Sub )TOTAL\b(?![^\d\n]{0,20}(?:EXCL|BEFORE|EXCLUDING|DISCOUNT|PAID|UNITS|QTY))[^\d\n\-]{0,40}([\d,]+\.\d{2})\s*$",
+        # 坑（Roylab）：这条行首锚定的规则本来就该认「Total S$ 571.06」——
+        # 币种符号 S$ 落在 [^\d\n\-]{0,40} 允许的字符集里，真正拦住它的是结尾
+        # 的 \s*$：OCR 把金额后面多认出一个孤立句点（"571.06 ."），句点不是空白，
+        # \s*$ 卡在那个点上就是不收尾，整条规则失效，Roylab 三行明细全部落空、
+        # 发票合计也没抽到。放宽收尾，容许金额后面跟一小段句点/短横这类 OCR 噪点。
+        r"^\s*(?<!Sub)(?<!Sub )TOTAL\b(?![^\d\n]{0,20}(?:EXCL|BEFORE|EXCLUDING|DISCOUNT|PAID|UNITS|QTY))[^\d\n\-]{0,40}([\d,]+\.\d{2})[\s.\-]{0,5}$",
         # 兜底：OCR 把同一横向位置的两栏内容读成了一整行，"Total" 后面直接跟着的不是
         # 数字而是另一栏文字，等真正的金额出现时前面已经不是行首、后面也没有币种。
         # 实测 Vazyme 扫描件被读成 "...Singapore Branch Total 279.04"（银行信息那栏

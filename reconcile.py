@@ -10,7 +10,7 @@ reconcile.py — PDF invoice × Procurement Tracking List 对账主程序
     Excel to PDF - not match Excel 说已开票、但没找到 PDF
 """
 
-__version__ = "2026-09-11.3"
+__version__ = "2026-09-11.5"
 
 import os
 import re
