@@ -18,7 +18,7 @@ independent of whether the amount happened to reconcile). See
 quality_flags_by_reasons()/_quality_reasons() below.
 """
 
-__version__ = "2026-09-11.9"
+__version__ = "2026-09-11.10"
 
 import os
 import re

@@ -29,9 +29,10 @@ Data-quality flagging, in place of a standalone review section (since
     user's request that section is gone; instead every row carries this signal
     inline, wherever it already appears:
       - matched / Xero import (flat tables, can't have per-row buttons):
-        flagged rows are highlighted yellow via a pandas Styler, and a small
-        picker tool below the table (styled_table + render_pdf_viewer) lets
-        you select one of the flagged invoices and open its PDF inline.
+        flagged rows are highlighted (a warm peach, see HIGHLIGHT below) via a
+        pandas Styler, and a small picker tool below the table
+        (styled_table + render_pdf_viewer) lets you select one of the flagged
+        invoices and open its PDF inline.
       - discrepancy / No Ledger Match / No Invoice Found (expander cards):
         each flagged group shows its reasons via st.warning(...) plus a
         "View invoice PDF" button that toggles an inline preview — all inside
@@ -41,7 +42,7 @@ Data-quality flagging, in place of a standalone review section (since
     from pdf_bytes captured into session_state at upload time.
 """
 
-__version__ = "2026-09-11.9"
+__version__ = "2026-09-11.10"
 
 import base64
 import os
@@ -66,7 +67,10 @@ from reconcile import reconcile, find_candidates, write_output, OUT_COLS
 
 NUMERIC_COLS = ("Unit no", "Unit Price", "Amount excl. GST", "GST", "Amount incl. GST")
 DATE_COLS = ("Invoice date", "Due Date")
-HIGHLIGHT = "background-color: #fff3b0"          # native Streamlit warning-yellow
+# Warm peach, not yellow: the rest of the app (see .streamlit/config.toml) is
+# themed in a fresh sage/mint palette, so a flagged row needs a color that
+# still reads as "needs a second look" by contrast rather than blending in.
+HIGHLIGHT = "background-color: #FBE3C8"
 
 
 def _safe_df(rows):
@@ -86,7 +90,7 @@ def show(df, **kw):
 
 
 def styled_table(rows, **kw):
-    """Like show(), but yellow-highlights rows whose invoice carries a
+    """Like show(), but highlights (a warm peach — see HIGHLIGHT) rows whose invoice carries a
     quality flag (OCR/AI-read, unusual tax rate, missing date, etc.) — used
     for matched and the Xero import list. Those are flat tables and can't
     have a per-row "view PDF" button the way the expander-based tabs do;
@@ -143,7 +147,7 @@ def render_pdf_viewer(rows, state, key_prefix):
     opts = _flagged_pdf_options(rows, state.get("pdf_bytes") or {})
     if not opts:
         return
-    st.caption("Rows highlighted yellow above have a data-quality flag (OCR/AI read, unusual tax "
+    st.caption("Rows highlighted above have a data-quality flag (OCR/AI read, unusual tax "
                "rate, missing date, etc.) — pick one below to check the original PDF.")
     labels = [o[0] for o in opts]
     pick = st.selectbox("Flagged invoice", labels, key=f"{key_prefix}_pick")
@@ -471,7 +475,7 @@ tab_xero, tab_matched, tab_disc, tab_pdf_only, tab_excel_only, tab_pending = st.
 with tab_xero:
     st.caption("Every matched invoice shows up here automatically — both the ones that matched "
                "automatically and the ones manually confirmed from other tabs. Download this list "
-               "directly to review before importing into Xero. Rows highlighted yellow have a "
+               "directly to review before importing into Xero. Highlighted rows have a "
                "data-quality flag — see the picker below to check the original PDF.")
     styled_table(state["matched"])
     render_pdf_viewer(state["matched"], state, key_prefix="xero")
@@ -481,7 +485,7 @@ with tab_xero:
                        key="xero_download")
 
 with tab_matched:
-    st.caption("Rows highlighted yellow were read by OCR/AI or have another data-quality flag "
+    st.caption("Highlighted rows were read by OCR/AI or have another data-quality flag "
                "worth a second look — use the picker below to open the original PDF.")
     styled_table(state["matched"])
     render_pdf_viewer(state["matched"], state, key_prefix="matched")

@@ -1,0 +1,23 @@
+# Custom theme — "fresh" (清新风) palette: sage/mint green on a near-white
+# canvas. This is the standard, supported way to theme a Streamlit app (as
+# opposed to injecting custom CSS everywhere), so it keeps working across
+# Streamlit Community Cloud reboots/reruns without extra maintenance.
+#
+# This file must be uploaded to GitHub too, at the path
+# netlify_scripts/.streamlit/config.toml (same folder as app.py) — Streamlit
+# Cloud only picks up theme settings from that exact location.
+
+[theme]
+base = "light"
+primaryColor = "#4F9C7E"                  # sage green — primary buttons, active tab, focus rings
+backgroundColor = "#F7FBF8"                # near-white with a faint mint tint — main canvas
+secondaryBackgroundColor = "#E7F2EA"       # light sage — sidebar, inputs, code blocks
+textColor = "#243B31"                      # deep forest slate — body text
+linkColor = "#2F7D5D"
+borderColor = "#CFE3D6"
+dataframeBorderColor = "#D9E8DE"
+dataframeHeaderBackgroundColor = "#E3F0E7"
+baseRadius = "medium"
+buttonRadius = "medium"
+font = "sans serif"
+showWidgetBorder = true
