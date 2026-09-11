@@ -42,7 +42,7 @@ Data-quality flagging, in place of a standalone review section (since
     from pdf_bytes captured into session_state at upload time.
 """
 
-__version__ = "2026-09-11.10"
+__version__ = "2026-09-11.11"
 
 import base64
 import os
@@ -291,15 +291,40 @@ def render_movable_cases(groups, state, source_key, title_fn, note_fn, key_prefi
                 st.rerun()
 
 
+def _xero_date(v):
+    """Format a date-ish value (python date, pandas Timestamp, NaT, None, or
+    a plain string) as "dd/mm/yyyy" — the format Xero's import expects.
+    Returns "" when there's nothing usable, rather than letting a NaT or a
+    datetime's "00:00:00" time component leak into the exported cell."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and pd.isna(v):
+        return ""
+    ts = pd.to_datetime(v, errors="coerce")
+    if pd.isna(ts):
+        return ""
+    return ts.strftime("%d/%m/%Y")
+
+
 def _xero_export(rows):
     """Export the current matched rows as a downloadable list, using the same
     columns (OUT_COLS) as the matched sheet in outcome.xlsx. This is not an
     official Xero import template — matching Xero's actual Bills import
     format would need extra mappings like AccountCode/TaxType. Once we know
     exactly what fields Xero needs, this can be adjusted; for now it's a
-    general-purpose, reviewable list."""
+    general-purpose, reviewable list.
+
+    Invoice date / Due Date are written as plain "dd/mm/yyyy" text, per
+    Xero's expected import format — not a datetime cell (which Excel would
+    otherwise show with a trailing "00:00:00") and never blank via NaT. When
+    an invoice's Due Date wasn't extracted, it falls back to that same
+    invoice's Invoice date rather than exporting an empty cell."""
     buf = BytesIO()
     df = pd.DataFrame(rows)[OUT_COLS] if rows else pd.DataFrame(columns=OUT_COLS)
+    if not df.empty:
+        df["Invoice date"] = df["Invoice date"].map(_xero_date)
+        df["Due Date"] = df["Due Date"].map(_xero_date)
+        df["Due Date"] = df["Due Date"].where(df["Due Date"] != "", df["Invoice date"])
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="To Import to Xero")
     buf.seek(0)

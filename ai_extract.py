@@ -1,4 +1,4 @@
-__version__ = "2026-09-11.10"
+__version__ = "2026-09-11.11"
 
 """
 ai_extract.py — reads invoices with a vision model (only for the ones that regex and OCR can't handle)

@@ -1,6 +1,28 @@
-# 更新说明 · 2026-09-11.10
+# 更新说明 · 2026-09-11.11
 
-请把整个目录（全部 .py 文件，以及这次新增的 `.streamlit/config.toml`）覆盖，版本号必须一致，否则界面会报「文件版本不一致」。
+请把整个目录（全部 .py 文件，以及 `.streamlit/config.toml`）覆盖，版本号必须一致，否则界面会报「文件版本不一致」。
+
+## 2026-09-11.11：「To Import to Xero」清单里的日期改成 Xero 要的 dd/mm/yyyy 纯文本，不再有 00:00:00 或 NaT
+
+用户反馈：「To Import to Xero」导出的清单里，Invoice date 和 Due Date 两列需要是 `dd/mm/yyyy` 格式，不能出现时间部分（`00:00:00`），也不能出现 `NaT`；如果这张发票没有 Due Date，就用 Invoice date 顶上去。
+
+### 根因
+
+这个导出（`app.py` 的 `_xero_export()`）之前是把 matched 里的原始日期值（有的是 `datetime.date`，有的是从台账 Excel 读出来的 `pandas.Timestamp`，有的因为没抽到就是 `None`/`NaT`）直接连同其他列一起丢给 `pandas.to_excel()`。pandas 把日期类的值写进 Excel 时用的是日期时间单元格，Excel 打开后即使只存了日期也会带出 `00:00:00`；缺失值（`None`/`NaT`）有时会被原样写成文本 `NaT`。这两个问题都是"直接转发原始值"导致的，不是抽取逻辑的问题。
+
+### 改了什么
+
+只改了 `app.py` 的 `_xero_export()`（`reconcile.py` 的匹配/抽取逻辑、`outcome.xlsx` 的导出不受影响，因为用户这次明确说的是"To import to Xero"这一份清单）：
+
+1. 新增 `_xero_date(v)`：用 `pandas.to_datetime(v, errors="coerce")` 把任何日期类型（`date`、`Timestamp`、字符串）统一转成日期，转不出来（`None`/`NaT`/空值）就返回空字符串，能转出来就用 `strftime("%d/%m/%Y")` 格式化成纯文本——因为写进单元格的是字符串而不是日期时间对象，Excel 不会再自己加一个 `00:00:00` 上去。
+2. `Invoice date`、`Due Date` 两列在导出前都先过一遍 `_xero_date`。
+3. 如果一行的 `Due Date` 格式化后是空字符串（原始值没抽到），就用同一行已经格式化好的 `Invoice date` 顶上去（`df["Due Date"].where(df["Due Date"] != "", df["Invoice date"])`）；如果两个都没有，就都留空——这种情况本身就是发票日期本身没抽到，没有别的信息可以填。
+
+### 测试方法
+
+搭了 4 种场景直接跑 `_xero_export()` 并用 openpyxl 读回写出的 `.xlsx` 逐格核对：①两个日期都正常（`datetime.date`）——两列都正确输出 `dd/mm/yyyy` 文本，没有时间部分；②Invoice date 是 `pandas.Timestamp`、Due Date 缺失（`None`）——Due Date 正确回退成跟 Invoice date 一样的日期；③两个都缺失（`None`）——两列都是空单元格，不是字符串 `"NaT"`；④Invoice date 缺失（`pandas.NaT`）、Due Date 正常——Invoice date 留空，Due Date 正常输出，不会反过来被 Invoice date 污染。全部符合预期。`python3 -m py_compile` 确认全部 7 个 .py 文件正常编译。
+
+版本号统一改为 `2026-09-11.11`。
 
 ## 2026-09-11.10：整体配色改成清新风（薄荷/鼠尾草绿）
 

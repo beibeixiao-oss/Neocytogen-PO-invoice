@@ -9,7 +9,7 @@ the "Neocytogen - outcome.xlsx" template.
     df, pending = load_tracking_list("Neocytogen Procurement Tracking List (2026).xlsx")
 """
 
-__version__ = "2026-09-11.10"
+__version__ = "2026-09-11.11"
 
 import re
 import pandas as pd
