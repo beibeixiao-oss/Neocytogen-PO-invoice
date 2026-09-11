@@ -14,7 +14,7 @@ from datetime import datetime
 
 import pdfplumber
 
-__version__ = "2026-09-11.2"
+__version__ = "2026-09-11.3"
 
 # 同一字段的多种标签写法，按顺序尝试
 # 买方是 Neocytogen —— 任何抽成这个的供应商结果都是错的

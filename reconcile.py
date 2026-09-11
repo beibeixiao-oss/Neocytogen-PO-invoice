@@ -10,7 +10,7 @@ reconcile.py — PDF invoice × Procurement Tracking List 对账主程序
     Excel to PDF - not match Excel 说已开票、但没找到 PDF
 """
 
-__version__ = "2026-09-11.2"
+__version__ = "2026-09-11.3"
 
 import os
 import re
@@ -405,6 +405,47 @@ def reconcile(xlsx_path, pdf_source):
                 f" 与台账一致（本张 {t}）"))
     _batched = {id(i) for g in batch_ok.values() for _, i in g}
     candidates = [(k, i) for k, i in candidates if id(i) not in _batched]
+
+    # 同一 PO 下多张发票都没能识别出发票号、加总也对不上台账（上面「分批开票」
+    # 那步失败）：以前这种情况会让每一张都去跟台账里没认领的全部行比总和，
+    # 报出来的差额是「台账整组之和 - 这一张」，既没意义还会连累明明对得上的那张
+    # 也被判成 mismatch（真实案例：同一 PO 两张洗衣发票，其中一张金额和台账某一
+    # 行完全一致，只因为另一张对不上就被一起报错，Note 里的台账合计跟这张发票
+    # 实际对应的那行对不上号，容易让人怀疑是不是台账录错了）。
+    # 张数和台账未认领行数对得上时，改成按金额就近一对一配对：每张发票配它金额
+    # 最接近的那一行台账，再各自判断是否在容差内——这样报出来的差额才是这一张
+    # 真正对应哪一行、差多少。张数对不上（更常见是行数与发票数不等）时不做这个
+    # 配对，退回原来的整组比较，避免瞎猜配错。
+    _paired = set()
+    for pk, group in _by_po_pdf.items():
+        if pk in batch_ok or len(group) < 2:
+            continue
+        rows = by_po.get(pk, [])
+        if len(rows) != len(group):
+            continue
+        if any((i.get("subtotal") or {}).get("amount_incl") is None for _, i in group):
+            continue
+        remaining_rows = list(rows)
+        for _key, inv in sorted(group, key=lambda kv: (kv[1].get("subtotal") or {}).get("amount_incl")):
+            p_incl = (inv.get("subtotal") or {}).get("amount_incl")
+            # 注意：rows 里是 pandas Series，list.remove() 靠 == 比较会在多值场景下
+            # 抛 "truth value of a Series is ambiguous"，改成按下标 pop，避免这个坑。
+            best_idx = min(range(len(remaining_rows)),
+                           key=lambda idx: abs(remaining_rows[idx]["Amount incl. GST"] - p_incl))
+            best = remaining_rows.pop(best_idx)
+            gdf = pd.DataFrame([best])
+            x_incl = best["Amount incl. GST"]
+            tag = (f"按金额就近配对（该 PO 下 {len(group)} 张发票均未能识别出发票号，"
+                   f"按合计金额分别配对台账对应行，而非整组合计比较）")
+            if abs(x_incl - p_incl) <= TOLERANCE:
+                matched.extend(merged_rows(inv, gdf, tag))
+            else:
+                diff = round(p_incl - x_incl, 2)
+                discrepancy.extend(merged_rows(
+                    inv, gdf, "；".join([tag, f"金额不符：台账 {x_incl} vs 发票 {p_incl}（差 {diff}）"])))
+            _paired.add(id(inv))
+        used_po.add(pk)
+    candidates = [(k, i) for k, i in candidates if id(i) not in _paired]
 
     # 预扫一遍：先确定哪些台账行会被发票号直接认领。
     # 必须放在主循环之前 —— 否则「已认领」取决于遍历顺序，
