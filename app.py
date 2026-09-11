@@ -1,22 +1,27 @@
 """
-app.py — 采购发票对账工具（界面版）
+app.py — Purchase Invoice Reconciliation Tool (UI)
 
     streamlit run app.py
 
-左边传 Procurement Tracking List，右边传发票 PDF（可多选）。
-传一张 = 单张核对，传一整个月 = 批量对账，走的是同一套逻辑。
+Upload the Procurement Tracking List on one side and the invoice PDF(s) on the
+other (multiple files allowed). Upload one PDF for a single check, or a whole
+month's worth for a batch reconciliation — both paths use the same logic.
 
-交互式编辑（2026-09-11.5 起）：
-    对账结果第一次算出来后存进 st.session_state，后面点"移到 matched"
-    "已核实"这些按钮触发的都是页面重跑（Streamlit 的机制），如果每次重跑
-    都重新调 reconcile()，编辑过的东西全部作废。所以本文件下半部分全部
-    对 st.session_state["reconciled"] 这份可变状态操作，只有再点一次
-    "开始对账" 才会用新上传的文件重新生成、扔掉旧的编辑。这些编辑只在
-    本次会话里有效——下载 outcome.xlsx 时会带上，但刷新页面/重新上传
-    同一批文件不会记得之前做过的操作（按用户要求，暂不做跨会话持久化）。
+Interactive editing (since 2026-09-11.5):
+    Once a reconciliation run has been computed, the results are stored in
+    st.session_state. Buttons like "Move to matched" or "Verified" all work by
+    triggering a page rerun (that's how Streamlit works) — if every rerun
+    called reconcile() again from scratch, any edits made on screen would be
+    discarded. So the lower half of this file operates entirely on the mutable
+    state in st.session_state["reconciled"]; only clicking "Run Reconciliation"
+    again regenerates it from the newly uploaded files and drops prior edits.
+    These edits are only valid for the current session — they are included
+    when you download outcome.xlsx, but refreshing the page or re-uploading
+    the same files will not remember what you did before (per the user's
+    request, there is no cross-session persistence yet).
 """
 
-__version__ = "2026-09-11.5"
+__version__ = "2026-09-11.7"
 
 import os
 import tempfile
@@ -25,9 +30,11 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 
-# Streamlit Community Cloud 没有 .env 文件，key 存在 App -> Settings -> Secrets 里。
-# ai_extract.py 只认 os.environ / 本地 .env，这里把 Secrets 桥接成环境变量，
-# 本地开发（用 .env）和云端部署（用 st.secrets）走的是同一份代码不用改。
+# Streamlit Community Cloud has no .env file — the key lives in
+# App -> Settings -> Secrets. ai_extract.py only looks at os.environ / a local
+# .env, so we bridge Secrets into an environment variable here. That way local
+# development (.env) and the cloud deployment (st.secrets) run the exact same
+# code with no changes needed.
 if "ANTHROPIC_API_KEY" not in os.environ:
     try:
         os.environ["ANTHROPIC_API_KEY"] = st.secrets["ANTHROPIC_API_KEY"]
@@ -41,8 +48,9 @@ DATE_COLS = ("Invoice date", "Due Date")
 
 
 def _safe_df(rows):
-    """安全转成表格：object 列一律转字符串，避免 Arrow 类型冲突。
-    rows 可以是 list[dict] 也可以是现成的 DataFrame。"""
+    """Convert to a table safely: every object column is cast to string to
+    avoid Arrow type conflicts. rows can be a list[dict] or an existing
+    DataFrame."""
     df = pd.DataFrame(rows).copy()
     for c in df.columns:
         if df[c].dtype == "object":
@@ -56,20 +64,26 @@ def show(df, **kw):
 
 
 def _to_out_rows(rows):
-    """把任意来源的行（sheets 里的 dict，或 pending DataFrame 转出来的 dict）
-    统一成「只含 OUT_COLS」的干净 dict list，缺的字段补 None。这样 matched /
-    discrepancy / pdf_only / excel_only / pending 五份数据格式完全一致，
-    下面的编辑、分组、移动逻辑才能共用同一套代码，不用为 pending 的列名
-    差异（原本没有 Source/Note）单独写一套。"""
+    """Normalize rows from any source (dicts from the sheets, or dicts
+    converted from the pending DataFrame) into a clean dict list containing
+    only OUT_COLS, filling any missing field with None. This keeps matched /
+    discrepancy / pdf_only / excel_only / pending in exactly the same shape,
+    so the editing, grouping, and move logic below can share one code path
+    instead of a separate one for pending's column differences (it originally
+    had no Source/Note)."""
     return [{c: r.get(c) for c in OUT_COLS} for r in rows]
 
 
 def _ensure_out_cols(r):
-    """确保 dict 至少包含 OUT_COLS 的每一个字段（缺的补 None），但不动其余
-    多出来的字段。pending 从 excel_loader 出来时压根没有 Source/Note 这两列——
-    直接转 dict 会缺这两个键，渲染时选 OUT_COLS 会直接 KeyError（这个坑是写
-    自动化测试时才测出来的：本地随手点一下不一定会踩到，得真有 pending 记录
-    才会炸）。同时要保留 _status/_row，write_output() 写 pending sheet 要用。"""
+    """Make sure a dict contains every field in OUT_COLS (filling any missing
+    one with None), without touching any extra fields it already has. Rows
+    coming out of excel_loader's pending DataFrame simply don't have a
+    Source/Note column — converting straight to dict leaves those keys
+    missing, and rendering with OUT_COLS would raise a KeyError (this was
+    only caught by writing automated tests — casual manual clicking doesn't
+    necessarily hit it; it only blows up once there's an actual pending
+    record). Also keeps _status/_row, which write_output() needs for the
+    pending sheet."""
     out = dict(r)
     for c in OUT_COLS:
         out.setdefault(c, None)
@@ -77,10 +91,12 @@ def _ensure_out_cols(r):
 
 
 def _coerce_row(r):
-    """st.data_editor 编辑完吐出来的是字符串（_safe_df 把所有列都转成了字符串），
-    金额/数量/日期这几列要转回真正的数值/日期类型再放进 matched——否则导出的
-    outcome.xlsx 和 Xero 清单里这些格子会变成文本，不能被当数字/日期用，
-    Excel 里没法求和、Xero 那边大概率也认不出。"""
+    """st.data_editor returns edited values as strings (_safe_df cast every
+    column to string) — the amount/quantity/date columns need to be converted
+    back to real numeric/date types before going into matched. Otherwise
+    those cells end up as text in the exported outcome.xlsx and the Xero
+    list, which can't be summed in Excel and likely won't be recognized by
+    Xero either."""
     out = dict(r)
     for c in NUMERIC_COLS:
         v = out.get(c)
@@ -102,9 +118,11 @@ def _coerce_row(r):
 
 
 def _group_contiguous(rows, keys=("Invoice Number", "PO Number", "Note")):
-    """把列表里连续且 (keys) 相同的行分成一组——同一张发票的多个明细行是
-    merged_rows()/pdf_rows() 一次性 extend 进去的，在列表里天然是连续的一段，
-    按这个分组就能把"编辑/移动"作用在整张发票上，而不是拆散成单独的行。"""
+    """Group consecutive rows that share the same (keys) into one group —
+    the multiple line items of one invoice are extended into the list
+    together by merged_rows()/pdf_rows(), so they're naturally contiguous.
+    Grouping this way lets "edit/move" act on the whole invoice at once
+    instead of splitting it into separate rows."""
     groups = []
     for row in rows:
         k = tuple(row.get(x) for x in keys)
@@ -116,13 +134,16 @@ def _group_contiguous(rows, keys=("Invoice Number", "PO Number", "Note")):
 
 
 def render_movable_cases(groups, state, source_key, title_fn, note_fn, key_prefix,
-                          button_label="✅ 确认并移到 matched"):
-    """discrepancy / 台账查无此单 / 台账有单缺发票 / 未开票 四个 tab 共用的渲染逻辑：
-    每一组（通常是同一张发票的若干明细行，或台账里的一行）放进一个可编辑表格，
-    配一个按钮，点了就把（可能已编辑过的）内容整组移进 matched，同时从原来
-    的列表里删掉、打上"这是人工手动处理的"说明，再 st.rerun() 刷新页面。"""
+                          button_label="✅ Confirm & move to matched"):
+    """Shared rendering logic for the discrepancy / No Ledger Match /
+    No Invoice Found / Not Yet Invoiced tabs: each group (usually the line
+    items of one invoice, or one ledger row) is shown in an editable table
+    with a button; clicking it moves the (possibly edited) content into
+    matched as a group, removes it from its original list, tags it with a
+    note explaining this was handled manually, and calls st.rerun() to
+    refresh the page."""
     if not groups:
-        st.write("无")
+        st.write("None")
         return
     for gi, grp in enumerate(groups):
         with st.expander(title_fn(grp)):
@@ -140,10 +161,12 @@ def render_movable_cases(groups, state, source_key, title_fn, note_fn, key_prefi
 
 
 def _xero_export(rows):
-    """把当前 matched 里的行导出成一份清单，跟 outcome.xlsx 的 matched sheet
-    是同一套列（OUT_COLS）。这不是 Xero 官方导入模板——真要对上 Xero 的
-    Bills 导入格式还需要 AccountCode/TaxType 这些映射信息，等确认了 Xero
-    那边具体要什么字段再调整，现在先给一份通用、可核对的清单。"""
+    """Export the current matched rows as a downloadable list, using the same
+    columns (OUT_COLS) as the matched sheet in outcome.xlsx. This is not an
+    official Xero import template — matching Xero's actual Bills import
+    format would need extra mappings like AccountCode/TaxType. Once we know
+    exactly what fields Xero needs, this can be adjusted; for now it's a
+    general-purpose, reviewable list."""
     buf = BytesIO()
     df = pd.DataFrame(rows)[OUT_COLS] if rows else pd.DataFrame(columns=OUT_COLS)
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -152,11 +175,12 @@ def _xero_export(rows):
     return buf
 
 
-st.set_page_config(page_title="采购发票对账", layout="wide")
-st.title("采购发票对账")
-st.caption("Excel 直读，PDF 抽取，按发票号精确匹配")
+st.set_page_config(page_title="Purchase Invoice Reconciliation", layout="wide")
+st.title("Purchase Invoice Reconciliation")
+st.caption("Reads Excel directly, extracts PDFs, matches exactly by invoice number")
 
-# 各模块版本必须一致。文件没换全是最常见的故障，放在最显眼处
+# All modules must be on the same version. Forgetting to replace every file is
+# the most common failure mode, so this check is placed front and center.
 import excel_loader as _el, invoice_extractor as _ie, reconcile as _rc
 _vers = {"app": __version__, "reconcile": getattr(_rc, "__version__", "?"),
          "invoice_extractor": getattr(_ie, "__version__", "?"),
@@ -166,18 +190,18 @@ try:
     _vers["ocr"] = getattr(_ocr, "__version__", "?")
     _ocr_ok, _ocr_path = _ocr.available(), _ocr.where()
 except ImportError:
-    _vers["ocr"] = "未安装"
+    _vers["ocr"] = "not installed"
     _ocr_ok, _ocr_path = False, None
 
 if len(set(_vers.values())) > 1:
-    st.error("文件版本不一致，请把所有 .py 重新覆盖一遍： "
-             + "；".join(f"{k} {v}" for k, v in _vers.items()))
+    st.error("File versions don't match — please re-upload all .py files: "
+             + "; ".join(f"{k} {v}" for k, v in _vers.items()))
 else:
-    st.caption(f"版本 {__version__} · OCR "
-               + (f"就绪（{_ocr_path}）" if _ocr_ok else "不可用"))
+    st.caption(f"Version {__version__} · OCR "
+               + (f"ready ({_ocr_path})" if _ocr_ok else "unavailable"))
 
 uploads = st.file_uploader(
-    "把台账 Excel 和发票 PDF 一起拖进来（可多选，顺序无所谓）",
+    "Drag in the ledger Excel and invoice PDF(s) together (multiple files OK, any order)",
     type=["xlsx", "xlsm", "pdf"], accept_multiple_files=True,
 )
 
@@ -185,32 +209,33 @@ xlsx_ups = [f for f in (uploads or []) if f.name.lower().endswith((".xlsx", ".xl
 pdf_ups = [f for f in (uploads or []) if f.name.lower().endswith(".pdf")]
 
 c1, c2 = st.columns(2)
-c1.metric("台账 Excel", len(xlsx_ups))
-c2.metric("发票 PDF", len(pdf_ups))
+c1.metric("Ledger Excel", len(xlsx_ups))
+c2.metric("Invoice PDFs", len(pdf_ups))
 
 if not uploads:
-    st.info("台账和发票一起拖进来即可。PDF 可以只传一张做单笔核对，也可以整个月一起传。")
+    st.info("Drag in the ledger and invoices together. You can upload a single PDF for a one-off check, or a whole month's worth for batch reconciliation.")
     st.stop()
 
 if not xlsx_ups:
-    st.warning("还缺台账 Excel（.xlsx）。")
+    st.warning("Still missing the ledger Excel (.xlsx).")
     st.stop()
 if not pdf_ups:
-    st.warning("还缺发票 PDF。")
+    st.warning("Still missing invoice PDFs.")
     st.stop()
 
 if len(xlsx_ups) > 1:
     names = [f.name for f in xlsx_ups]
-    pick = st.selectbox("传了多份 Excel，用哪一份作为台账？", names)
+    pick = st.selectbox("Multiple Excel files were uploaded — which one is the ledger?", names)
     xlsx_file = next(f for f in xlsx_ups if f.name == pick)
 else:
     xlsx_file = xlsx_ups[0]
 pdf_files = pdf_ups
 
-run_clicked = st.button("开始对账", type="primary")
+run_clicked = st.button("Run Reconciliation", type="primary")
 
 if run_clicked:
-    # 上传的是内存对象，落到临时目录后复用命令行版的同一套逻辑
+    # Uploads are in-memory objects; write them to a temp dir so we can reuse
+    # the exact same logic as the command-line version.
     with tempfile.TemporaryDirectory() as tmp:
         xlsx_path = os.path.join(tmp, "tracking.xlsx")
         with open(xlsx_path, "wb") as f:
@@ -223,26 +248,31 @@ if run_clicked:
                 f.write(up.getbuffer())
             pdf_paths.append(p)
 
-        with st.spinner(f"正在处理 {len(pdf_paths)} 份发票…"):
+        with st.spinner(f"Processing {len(pdf_paths)} invoices…"):
             sheets, pending, ctx = reconcile(xlsx_path, pdf_paths)
 
-        # 兼容旧版 reconcile.py：缺字段时降级，不让整个页面崩掉
+        # Backward compatible with older reconcile.py: degrade gracefully on
+        # missing fields instead of crashing the whole page.
         ctx.setdefault("suspicious", [])
         ctx.setdefault("superseded", [])
         ctx.setdefault("unmatched_pdf", [])
         ctx.setdefault("failed", [])
 
-        # pending 比 matched/discrepancy 那几个多留了 _status/_row 两列——
-        # write_output() 写「pending (no invoice yet)」那个 sheet 要用到，
-        # 不能像其他几份那样直接压成只剩 OUT_COLS，否则导出会报 KeyError。
-        # 显示/编辑的时候（render_movable_cases 里）只会挑 OUT_COLS 出来用，
-        # 这两列不会出现在编辑框里，纯粹是留着给导出用的。
+        # pending keeps two extra columns, _status/_row, that matched/
+        # discrepancy/etc. don't — write_output() needs them for the
+        # "pending (no invoice yet)" sheet, so it can't be trimmed down to
+        # just OUT_COLS like the others or the export will raise a KeyError.
+        # When displaying/editing (in render_movable_cases) only OUT_COLS is
+        # picked out, so these two columns never show up in the edit form —
+        # they're kept purely for the export.
         pending_rows = [_ensure_out_cols(r) for r in
                         pending.drop(columns=["invoice_key", "po_key", "supplier_key"],
                                      errors="ignore").to_dict("records")]
 
-        # 这里点一次"开始对账"就是全新算一遍：之前编辑/移动/打勾的状态全部
-        # 扔掉重建——按用户要求，这些操作只在本次会话里有效，不用跨批次记住。
+        # Clicking "Run Reconciliation" always recomputes everything from
+        # scratch: any prior edits/moves/ticks are discarded and rebuilt —
+        # per the user's request, those actions are only valid for the
+        # current session and don't need to persist across runs.
         st.session_state["reconciled"] = {
             "matched": _to_out_rows(sheets["matched"]),
             "discrepancy": _to_out_rows(sheets["discrepancy"]),
@@ -260,8 +290,10 @@ state = st.session_state["reconciled"]
 ctx = state["ctx"]
 n_inv = len(ctx["invoices"])
 
-# 下载内容每次都从当前（可能已被编辑/移动过的）state 现算，这样下载的
-# outcome.xlsx 才会带上页面上做过的所有手动操作，不是对账刚跑完那一刻的快照。
+# The download is regenerated every time from the current state (which may
+# have been edited/moved since the run), so the downloaded outcome.xlsx
+# always reflects every manual action taken on screen, not just a snapshot
+# from the moment reconciliation finished.
 _sheets_now = {
     "matched": state["matched"],
     "discrepancy": state["discrepancy"],
@@ -275,63 +307,68 @@ write_output(_sheets_now, _pending_now, _buf, state["suspicious"], ctx.get("supe
 _buf.seek(0)
 
 m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("读入发票", n_inv)
-m2.metric("匹配成功", len({r["Invoice Number"] for r in state["matched"]}))
-m3.metric("金额不符", len(_group_contiguous(state["discrepancy"])))
-m4.metric("台账查无此单", len(_group_contiguous(state["pdf_only"])))
-m5.metric("台账有单缺发票", len(state["excel_only"]))
+m1.metric("Invoices read", n_inv)
+m2.metric("Matched", len({r["Invoice Number"] for r in state["matched"]}))
+m3.metric("Amount mismatch", len(_group_contiguous(state["discrepancy"])))
+m4.metric("No Ledger Match", len(_group_contiguous(state["pdf_only"])))
+m5.metric("No Invoice Found", len(state["excel_only"]))
 
-st.download_button("下载 outcome.xlsx", _buf,
+st.download_button("Download outcome.xlsx", _buf,
                    file_name="Neocytogen - outcome.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# 待核查：程序自己算出哪些结果可疑并排序，避免人工逐张点开核对。
-# 每条配一个"已核实"按钮，点了就从这个清单里拿掉——只是人工复核的勾选记录，
-# 不影响这张发票在 matched/discrepancy 里的状态，纯粹用来盯"还剩几张没看"。
+# Needs review: the program flags and ranks results it thinks look
+# suspicious, so a person doesn't have to open every single one to check.
+# Each one gets a "Verified" button — clicking it just removes it from this
+# list (a manual review checkmark); it doesn't change that invoice's status
+# in matched/discrepancy, it's purely to track "how many are still unreviewed".
 if ctx["superseded"]:
-    with st.expander(f"已忽略的 Proforma（{len(ctx['superseded'])} 张）"):
-        st.caption("同一 PO 已有 Tax Invoice，按规则只算 Tax Invoice。列在此处仅供查证。")
+    with st.expander(f"Ignored Proformas ({len(ctx['superseded'])})"):
+        st.caption("This PO already has a Tax Invoice, and by rule only the Tax Invoice is counted. Listed here for reference only.")
         show(ctx["superseded"])
 
 susp = state["suspicious"]
 if susp:
-    st.subheader(f"待核查 · {len(susp)} 张（共 {n_inv} 张）")
-    st.caption("按疑点数量排序。核实过的点右边「已核实」拿掉，不影响 matched/discrepancy 的判定。")
+    st.subheader(f"Needs Review · {len(susp)} of {n_inv}")
+    st.caption("Sorted by number of flags. Click \"Verified\" on the right once reviewed to remove it — this doesn't affect the matched/discrepancy determination.")
     for i, row in enumerate(list(susp)):
         sc1, sc2 = st.columns([9, 1])
         with sc1:
-            st.write(f"**{row.get('发票号') or '(号未识别)'}** · {row.get('供应商')} · "
-                     f"合计 {row.get('合计')} · 疑点数 {row.get('疑点数')}  \n"
-                     f"{row.get('需要核查的原因')}  \n"
-                     f"*{row.get('文件')}*")
+            st.write(f"**{row.get('Invoice No') or '(number not recognized)'}** · {row.get('Supplier')} · "
+                     f"Total {row.get('Total')} · Flags {row.get('Flags')}  \n"
+                     f"{row.get('Reason')}  \n"
+                     f"*{row.get('File')}*")
         with sc2:
-            if st.button("✓ 已核实", key=f"susp_done_{i}"):
+            if st.button("✓ Verified", key=f"susp_done_{i}"):
                 state["suspicious"] = [r for r in state["suspicious"] if r is not row]
                 st.rerun()
         st.divider()
 else:
-    st.success(f"{n_inv} 张发票全部通过自动校验，无需人工核查。")
+    st.success(f"All {n_inv} invoices passed automatic validation — no manual review needed.")
 
-# 抽取告警：字段没抽到、行加总对不上等，先让人知道哪些结果不可全信
+# Extraction warnings: fields that couldn't be extracted, line totals that
+# don't add up, etc. — surfaced up front so it's clear which results might
+# not be fully trustworthy.
 warned = [i for i in ctx["invoices"].values() if i["warnings"]]
 if warned or ctx["failed"]:
-    with st.expander(f"提取告警（{len(warned) + len(ctx['failed'])} 份）", expanded=False):
+    with st.expander(f"Extraction warnings ({len(warned) + len(ctx['failed'])})", expanded=False):
         for inv in warned + ctx["failed"]:
             st.write(f"**{inv.get('invoice_no') or inv['source_file']}** — "
-                     + "；".join(inv["warnings"]))
+                     + "; ".join(inv["warnings"]))
 
 tab_xero, tab_matched, tab_disc, tab_pdf_only, tab_excel_only, tab_pending = st.tabs(
-    ["📤 To Import to Xero", "matched", "discrepancy", "台账查无此单", "台账有单缺发票", "未开票"]
+    ["📤 To Import to Xero", "matched", "discrepancy", "No Ledger Match", "No Invoice Found", "Not Yet Invoiced"]
 )
 
 with tab_xero:
-    st.caption("matched 的发票都会自动出现在这里——包括原本就 matched 的，以及从其他 "
-               "tab 手动确认移过来的。这份清单可以直接下载去核对再导入 Xero。")
+    st.caption("Every matched invoice shows up here automatically — both the ones that matched "
+               "automatically and the ones manually confirmed from other tabs. Download this list "
+               "directly to review before importing into Xero.")
     if state["matched"]:
         show(pd.DataFrame(state["matched"])[OUT_COLS])
     else:
-        st.write("暂无 matched 发票。")
-    st.download_button("下载 Xero 导入清单", _xero_export(state["matched"]),
+        st.write("No matched invoices yet.")
+    st.download_button("Download Xero import list", _xero_export(state["matched"]),
                        file_name="To Import to Xero.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                        key="xero_download")
@@ -340,62 +377,70 @@ with tab_matched:
     if state["matched"]:
         show(pd.DataFrame(state["matched"])[OUT_COLS])
     else:
-        st.write("无")
+        st.write("None")
 
 with tab_disc:
-    st.caption("金额跟台账对不上的发票。可以在下面直接改内容（比如台账本身有误、或者要按发票"
-               "实收金额为准），改完点按钮就整张移到 matched（会同时出现在 To Import to Xero 里）。")
+    st.caption("Invoices whose amount doesn't match the ledger. You can edit the content directly "
+               "below (e.g. if the ledger itself was wrong, or the invoice's actual amount should "
+               "win) — click the button after editing to move the whole invoice to matched (it will "
+               "also appear in To Import to Xero).")
     render_movable_cases(
         _group_contiguous(state["discrepancy"]), state, "discrepancy",
-        title_fn=lambda grp: (f"发票 {grp[0].get('Invoice Number') or '(号未识别)'} · "
+        title_fn=lambda grp: (f"Invoice {grp[0].get('Invoice Number') or '(number not recognized)'} · "
                                f"{grp[0].get('Supplier')} · {(grp[0].get('Note') or '')[:60]}"),
-        note_fn=lambda grp: f"人工核对后手动确认匹配（原自动比对结果：{grp[0].get('Note') or ''}）",
+        note_fn=lambda grp: f"Manually confirmed as matched after review (original auto-match result: {grp[0].get('Note') or ''})",
         key_prefix="disc",
     )
 
 with tab_pdf_only:
-    st.caption("有发票 PDF，但台账里查无此单（发票号/PO 都对不上）。核实清楚后可以手动把它配到 "
-               "matched——移过去会带一条说明，写清楚这不是程序自动匹配的。")
+    st.caption("There's an invoice PDF, but no matching entry in the ledger (neither invoice number "
+               "nor PO matches). Once you've confirmed it's correct, you can manually match it to "
+               "matched — moving it adds a note making clear this wasn't an automatic match.")
     render_movable_cases(
         _group_contiguous(state["pdf_only"]), state, "pdf_only",
-        title_fn=lambda grp: (f"发票 {grp[0].get('Invoice Number') or grp[0].get('PO Number') or '(未识别)'} · "
+        title_fn=lambda grp: (f"Invoice {grp[0].get('Invoice Number') or grp[0].get('PO Number') or '(not recognized)'} · "
                                f"{grp[0].get('Supplier')}"),
-        note_fn=lambda grp: f"⚠ 未自动匹配到台账——人工手动添加至 matched（原提示：{grp[0].get('Note') or ''}）",
-        key_prefix="pdfonly", button_label="➕ 手动加入 matched",
+        note_fn=lambda grp: f"⚠ Not auto-matched to the ledger — manually added to matched (original note: {grp[0].get('Note') or ''})",
+        key_prefix="pdfonly", button_label="➕ Manually add to matched",
     )
 
 with tab_excel_only:
-    st.caption("台账已记录、但没找到对应发票 PDF。如果发票已经拿到了、只是这次没传或者没识别出来，"
-               "可以直接在这条上手动确认——移过去会带一条说明，写清楚这不是程序自动匹配的。")
+    st.caption("The ledger has this entry, but no matching invoice PDF was found. If you already "
+               "have the invoice and it just wasn't uploaded or recognized this time, you can "
+               "confirm it manually here — moving it adds a note making clear this wasn't an "
+               "automatic match.")
     render_movable_cases(
         [[r] for r in state["excel_only"]], state, "excel_only",
         title_fn=lambda grp: f"{grp[0].get('Invoice Number') or grp[0].get('PO Number')} · {grp[0].get('Supplier')}",
-        note_fn=lambda grp: f"⚠ 台账记录未找到对应发票 PDF——人工手动添加至 matched（原提示：{grp[0].get('Note') or ''}）",
-        key_prefix="exlonly", button_label="➕ 手动加入 matched",
+        note_fn=lambda grp: f"⚠ No matching invoice PDF found for this ledger entry — manually added to matched (original note: {grp[0].get('Note') or ''})",
+        key_prefix="exlonly", button_label="➕ Manually add to matched",
     )
 
 with tab_pending:
-    st.caption("货未到或未开票，不算 mismatch。如果其实已经开票入账了，只是状态还没更新，"
-               "也可以在这条上手动确认——移过去会带一条说明，写清楚这不是程序自动匹配的。")
+    st.caption("Goods not yet received or not yet invoiced — not counted as a mismatch. If it's "
+               "actually already been invoiced and the status just hasn't been updated yet, you "
+               "can confirm it manually here — moving it adds a note making clear this wasn't an "
+               "automatic match.")
     render_movable_cases(
         [[r] for r in state["pending"]], state, "pending",
         title_fn=lambda grp: f"{grp[0].get('Invoice Number') or grp[0].get('PO Number')} · {grp[0].get('Supplier')}",
-        note_fn=lambda grp: "⚠ 原状态为未开票/货未到——人工手动添加至 matched",
-        key_prefix="pending", button_label="➕ 手动加入 matched",
+        note_fn=lambda grp: "⚠ Originally marked not yet invoiced / goods not received — manually added to matched",
+        key_prefix="pending", button_label="➕ Manually add to matched",
     )
 
-# 台账里找不到时，列出最接近的几条供人工判断
+# When nothing in the ledger matches, list the closest candidates for manual review.
 if ctx["unmatched_pdf"]:
     st.divider()
-    st.subheader("人工核对建议")
-    st.caption("以下仅为参考排序，程序不会据此自动匹配 —— 发票号必须完全相等才算 matched")
+    st.subheader("Suggestions for Manual Review")
+    st.caption("These are ranked for reference only — the program never auto-matches on this basis; "
+               "the invoice number must match exactly to count as matched.")
     for inv in ctx["unmatched_pdf"]:
         total = (inv.get("subtotal") or {}).get("amount_incl")
-        with st.expander(f"发票 {inv.get('invoice_no')} · {inv.get('supplier')} · {total}"):
+        with st.expander(f"Invoice {inv.get('invoice_no')} · {inv.get('supplier')} · {total}"):
             cands = find_candidates(ctx["expected"], inv)
             if cands:
                 show(cands)
             else:
-                st.write("台账里没有相近的记录。")
+                st.write("No similar record found in the ledger.")
             for w in inv["warnings"]:
                 st.warning(w)

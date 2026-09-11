@@ -1,33 +1,36 @@
 """
-ocr.py — 扫描件 PDF 的文字识别
+ocr.py — text recognition for scanned PDF invoices
 
-只在 pdfplumber 抽不到文字时启用。用 PyMuPDF 把页面渲染成高分辨率图片，
-再交给 Tesseract 识别。
+Only kicks in when pdfplumber can't extract any text. Uses PyMuPDF to render
+pages as high-resolution images, then hands them to Tesseract for recognition.
 
-依赖：
+Dependencies:
     pip install pytesseract pymupdf pillow
-    另需安装 Tesseract 本体（Windows: https://github.com/UB-Mannheim/tesseract/wiki）
+    Tesseract itself must also be installed (Windows: https://github.com/UB-Mannheim/tesseract/wiki)
 
-注意：OCR 出来的文字准确率远低于原生 PDF，数字尤其容易错
-（0/O、1/l/I、5/S、8/B）。所以 OCR 结果必须经过金额等式校验，
-校验不过的一律进「待核查」，不能直接采信。
+Note: OCR text is far less accurate than native PDF text, and digits are
+especially error-prone (0/O, 1/l/I, 5/S, 8/B). So OCR results always go
+through the amount-equation validation; anything that fails goes into "needs
+review" — it's never trusted outright.
 """
 
 import os
 import re
 import shutil
 
-__version__ = "2026-09-11.5"
+__version__ = "2026-09-11.7"
 
-DPI = 300          # 低于 300 识别率明显下降；再高收益有限且很慢
+DPI = 300          # Recognition quality drops noticeably below 300; higher gives little benefit and is much slower
 _TESS_OK = None
 
 
 def _find_tesseract():
-    """定位 tesseract.exe。
+    """Locate tesseract.exe.
 
-    Windows 装完常常不在 PATH 里，开始菜单里那个 Tesseract-OCR 文件夹只是快捷方式，
-    不是安装目录。所以依次尝试：PATH -> 注册表 -> 常见安装路径 -> 全盘常见位置搜索。
+    On Windows it's often not on PATH after install, and the Tesseract-OCR
+    folder in the Start menu is just a shortcut, not the install directory.
+    So this tries, in order: PATH -> registry -> common install paths -> a
+    broad search of common locations.
     """
     import pytesseract
 
@@ -36,7 +39,7 @@ def _find_tesseract():
 
     cands = []
 
-    # UB Mannheim 安装包会把安装目录写进注册表
+    # The UB Mannheim installer writes the install directory to the registry
     if os.name == "nt":
         try:
             import winreg
@@ -67,7 +70,7 @@ def _find_tesseract():
         "/usr/bin/tesseract",
     ]
 
-    # 还是找不到就在常见根目录下搜一层
+    # Still not found — search one level deep under common root directories
     if os.name == "nt":
         import glob
         for root in [r"C:\Program Files", r"C:\Program Files (x86)",
@@ -83,14 +86,14 @@ def _find_tesseract():
 
 
 def where():
-    """返回实际使用的 tesseract 路径，方便排查。"""
+    """Returns the tesseract path actually in use, to make troubleshooting easier."""
     import pytesseract
     return (shutil.which("tesseract")
             or getattr(pytesseract.pytesseract, "tesseract_cmd", None))
 
 
 def available():
-    """OCR 是否可用。不可用时上层应跳过而不是报错。"""
+    """Whether OCR is available. When it isn't, callers should skip it rather than error out."""
     global _TESS_OK
     if _TESS_OK is None:
         try:
@@ -102,8 +105,9 @@ def available():
 
 
 def ocr_pdf(path, max_pages=4):
-    """返回 (纯文本, 排版文本)，与 pdfplumber 的两种模式对应，
-    这样下游解析逻辑完全不用改。识别失败返回 ("", "")。"""
+    """Returns (plain text, layout text), matching pdfplumber's two modes so
+    downstream parsing logic doesn't need to change at all. Returns ("", "")
+    on failure."""
     if not available():
         return "", ""
     import fitz
@@ -121,10 +125,10 @@ def ocr_pdf(path, max_pages=4):
             pix = page.get_pixmap(dpi=DPI)
             img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
             if img.mode != "L":
-                img = img.convert("L")          # 灰度，票据识别更稳
-            # psm 6：整页当作一个统一文本块，比默认模式更适合发票版式
+                img = img.convert("L")          # Grayscale — more stable for receipt/invoice recognition
+            # psm 6: treat the whole page as one uniform text block, better suited to invoice layouts than the default mode
             plain.append(pytesseract.image_to_string(img, config="--psm 6"))
-            # 保留字符位置，供「标签在上、值在下」的列对齐逻辑使用
+            # Keep character positions, for the "label above, value below" column-alignment logic to use
             layout.append(_layout_from_data(
                 pytesseract.image_to_data(img, config="--psm 6",
                                           output_type=pytesseract.Output.DICT)))
@@ -135,8 +139,8 @@ def ocr_pdf(path, max_pages=4):
 
 
 def _layout_from_data(data, char_w=9):
-    """把 Tesseract 的逐词坐标还原成等宽排版文本，
-    让 _label_below 的列对齐能在扫描件上同样生效。"""
+    """Reconstruct Tesseract's per-word coordinates into fixed-width layout
+    text, so _label_below's column alignment also works on scanned documents."""
     rows = {}
     n = len(data.get("text", []))
     for i in range(n):
@@ -144,7 +148,7 @@ def _layout_from_data(data, char_w=9):
         if not word:
             continue
         try:
-            if int(data["conf"][i]) < 30:      # 置信度过低的词直接丢
+            if int(data["conf"][i]) < 30:      # Drop words with too-low confidence outright
                 continue
         except (ValueError, TypeError):
             pass
@@ -163,8 +167,9 @@ def _layout_from_data(data, char_w=9):
 
 
 def fix_ocr_digits(s):
-    """只在「应当是数字」的字段上纠正常见混淆，绝不全文替换 ——
-    全文替换会把公司名里的 O 变成 0，制造新的错误。"""
+    """Only corrects common confusions on fields that are expected to be
+    numeric — never a blanket text-wide replace, which would turn the O in a
+    company name into a 0 and create a new error."""
     if s is None:
         return None
     return (str(s).replace("O", "0").replace("o", "0")

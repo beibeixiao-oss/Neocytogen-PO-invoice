@@ -1,16 +1,16 @@
 """
-reconcile.py — PDF invoice × Procurement Tracking List 对账主程序
+reconcile.py — PDF invoice x Procurement Tracking List reconciliation engine
 
-    python reconcile.py <tracking_list.xlsx> <invoice_pdf_folder> [输出.xlsx]
+    python reconcile.py <tracking_list.xlsx> <invoice_pdf_folder> [output.xlsx]
 
-输出四个 sheet，表头统一（12 列模板 + Source + Note）：
-    matched                  两边都有且金额一致
-    discrepancy              两边都有但金额对不上
-    PDF to Excel - not match 有发票、Excel 里查无此单
-    Excel to PDF - not match Excel 说已开票、但没找到 PDF
+Produces four sheets with a shared header (the 12-column template + Source + Note):
+    matched                  present on both sides, amounts agree
+    discrepancy              present on both sides, amounts don't agree
+    PDF to Excel - not match invoice exists, no matching entry in Excel
+    Excel to PDF - not match Excel says invoiced, but no matching PDF found
 """
 
-__version__ = "2026-09-11.5"
+__version__ = "2026-09-11.7"
 
 import os
 import re
@@ -31,11 +31,11 @@ TEMPLATE_COLS = [
     "Amount excl. GST", "GST", "Amount incl. GST",
 ]
 OUT_COLS = TEMPLATE_COLS + ["Source", "Note"]
-TOLERANCE = 0.05          # 金额容差：行级 GST 各家舍入方式不同，只在发票合计层面卡
+TOLERANCE = 0.05          # Amount tolerance: line-level GST rounding differs by vendor, so we only gate on the invoice total
 
 
 def pdf_rows(inv, source, note=""):
-    """一张发票 -> 若干行（每个 line item 一行），字段对齐模板"""
+    """One invoice -> one row per line item, fields aligned to the template."""
     rows = []
     for it in inv["line_items"]:
         rows.append({
@@ -64,21 +64,23 @@ def pdf_rows(inv, source, note=""):
             "Amount excl. GST": s.get("amount_excl"), "GST": s.get("gst"),
             "Amount incl. GST": s.get("amount_incl"),
             "Source": source,
-            "Note": "；".join(x for x in [note, "仅取到发票合计，无明细行"] if x),
+            "Note": "; ".join(x for x in [note, "Only the invoice total was extracted, no line items"] if x),
         })
         return rows
-    if not rows:      # 没抽到 line item 也要留痕，否则这张发票会凭空消失
+    if not rows:      # Keep a trace even when no line items were extracted, or the invoice would vanish silently
         rows.append({c: None for c in OUT_COLS} | {
             "Invoice Number": inv.get("invoice_no"), "PO Number": inv.get("po_no"),
             "Supplier": inv.get("supplier"), "Source": source,
-            "Note": (note + " / " if note else "") + "未抽到明细行",
+            "Note": (note + " / " if note else "") + "No line items extracted",
         })
     return rows
 
 
 def merged_rows(inv, grp, note=""):
-    """两边都有的发票：明细取台账（Item Description 是人写的，比从 PDF 抠出来的规范），
-    发票号 / PO / 供应商 / 日期 / 币种取 PDF（发票是付款依据）。"""
+    """A row present on both sides: line-item detail comes from the ledger (Item
+    Description is human-written and cleaner than what's scraped from the PDF);
+    invoice number / PO / supplier / date / currency come from the PDF (the
+    invoice is the basis for payment)."""
     rows = []
     for _, r in grp.iterrows():
         rows.append({
@@ -108,11 +110,14 @@ def excel_rows(df, note=""):
 
 
 def find_candidates(expected, inv, limit=5):
-    """发票在台账里找不到时，列出最可能的候选行供人工判断。
+    """When an invoice can't be found in the ledger, list the most likely
+    candidate rows for manual review.
 
-    只在「同一供应商」内找 —— BioLabs 与 BioBasic 名字相近却是两家公司，
-    跨供应商排序会让人逐条核对，比不给建议还费时间。
-    注意：这只是给人看的参考，程序绝不据此自动匹配（发票号必须精确相等）。
+    Only searches within the same supplier — BioLabs and BioBasic have similar
+    names but are different companies; cross-supplier ranking would just make
+    someone check every row, which wastes more time than giving no suggestion.
+    Note: this is reference only for a human — the program never auto-matches
+    on this basis (the invoice number must match exactly).
     """
     from rapidfuzz import fuzz
     from excel_loader import normalize_supplier
@@ -130,14 +135,14 @@ def find_candidates(expected, inv, limit=5):
             continue
         sim = max(fuzz.ratio(sup, row["supplier_key"]),
                   fuzz.partial_ratio(sup, row["supplier_key"]))
-        if sim < 85:                       # BioLab vs BioBasic 恰好卡在 80，阈值必须高于它
+        if sim < 85:                       # BioLab vs BioBasic lands right at 80, so the threshold must be above that
             continue
         amt = round(grp["Amount incl. GST"].sum(), 2)
         diff = None if total is None else round(amt - total, 2)
         gap = None
         if date is not None and pd.notna(row["Invoice date"]):
             gap = abs((pd.Timestamp(date) - pd.Timestamp(row["Invoice date"])).days)
-        # 金额一致最有说服力（多半只是发票号登错），其次是日期接近
+        # A matching amount is the strongest signal (usually just a mistyped invoice number); a close date is next
         score = (0 if diff is None else max(0, 60 - min(abs(diff), 60))) \
                 + (0 if gap is None else max(0, 30 - gap)) + sim * 0.1
         rows.append({
@@ -145,8 +150,8 @@ def find_candidates(expected, inv, limit=5):
             "Supplier": row["Supplier"],
             "Invoice date": row["Invoice date"],
             "Amount incl. GST": amt,
-            "金额差": diff,
-            "日期差(天)": gap,
+            "Amount diff": diff,
+            "Date diff (days)": gap,
             "_s": score,
         })
     rows.sort(key=lambda r: r["_s"], reverse=True)
@@ -156,16 +161,21 @@ def find_candidates(expected, inv, limit=5):
 
 
 def flag_suspicious(invoices, expected):
-    """自动挑出「值抽到了但可能抽错」的发票，按可疑程度排序。
+    """Automatically pick out invoices that were "extracted, but might be
+    extracted wrong", ranked by how suspicious they look.
 
-    抽不到会报错，抽错了不会 —— 后者才危险。这里用同供应商的历史分布做基准：
-    金额差一两个数量级、发票号格式与同行不一致、日期落在合理区间之外，都要人看一眼。
+    A field that fails to extract raises an error; a field that extracts to
+    the wrong value doesn't — the latter is the dangerous one. This uses the
+    historical distribution for the same supplier as a baseline: an amount
+    off by an order of magnitude, an invoice-number format that doesn't match
+    its peers, or a date outside a plausible range are all worth a human
+    glance.
     """
     import statistics
     from rapidfuzz import fuzz
     from excel_loader import normalize_supplier
 
-    # 按供应商归集台账里的金额与发票号格式，作为比较基准
+    # Group ledger amounts and invoice-number shapes by supplier, as a comparison baseline
     by_sup = {}
     for _, r in expected.iterrows():
         k = r["supplier_key"]
@@ -192,77 +202,84 @@ def flag_suspicious(invoices, expected):
 
         total = (inv.get("subtotal") or {}).get("amount_incl")
         if total is None:
-            reasons.append("未取到发票合计")
+            reasons.append("Invoice total not extracted")
         elif ref and len(ref["amts"]) >= 3:
             med = statistics.median(ref["amts"])
             if med > 0 and (total < med / 10 or total > med * 10):
-                reasons.append(f"金额 {total} 与该供应商中位数 {round(med, 2)} 相差十倍以上")
+                reasons.append(f"Amount {total} is more than 10x off this supplier's median of {round(med, 2)}")
 
         shape = _shape(inv.get("invoice_no"))
-        # Proforma 的号码由供应商另一套规则生成（如 PI- 对 INV-），格式不同属正常
+        # A Proforma's number follows the supplier's separate numbering scheme (e.g. PI- vs INV-), so a different shape is expected
         if ref and ref["shapes"] and shape not in ref["shapes"] and not inv.get("is_proforma"):
-            msg = f"发票号格式 {shape} 与该供应商台账中的 {'/'.join(sorted(ref['shapes'])[:3])} 不一致"
+            msg = f"Invoice number format {shape} doesn't match this supplier's ledger formats ({'/'.join(sorted(ref['shapes'])[:3])})"
             fix = suggest_repair(inv.get("invoice_no"), ref.get("numbers", set()))
             if fix:
-                msg += f"；{fix}"
+                msg += f"; {fix}"
             reasons.append(msg)
 
         d = inv.get("invoice_date")
         if d is None:
-            reasons.append("未取到发票日期")
+            reasons.append("Invoice date not extracted")
 
         s = inv.get("subtotal") or {}
         e, g, i = s.get("amount_excl"), s.get("gst"), s.get("amount_incl")
         if None not in (e, g, i) and abs(e + g - i) > 0.05:
-            reasons.append("税前+税额 ≠ 税后")
+            reasons.append("excl. GST + GST != incl. GST")
         if i and e and i > 0 and not (0 <= (i - e) / i < 0.15):
-            reasons.append(f"税率异常：{round((i - e) / i * 100, 1)}%")
+            reasons.append(f"Unusual tax rate: {round((i - e) / i * 100, 1)}%")
 
         if inv.get("ai"):
-            reasons.append("由视觉模型识别，数字需人工复核")
+            reasons.append("Read by the vision model — figures need manual review")
         if inv.get("ocr"):
-            reasons.append("扫描件经 OCR 识别，数字需人工复核")
-        # 按用户要求：Proforma 跟正常 Tax Invoice 一样处理，不再仅因为是 Proforma
-        # 就单独进「待核查」——它本来就正常参与对账（见 README「关于 matched 与
-        # 待核查」），这里只是不再额外拿这一条刷疑点数。真正该被挑出来复核的
-        # 还是金额等式、税率、OCR/AI 来源这些信号，跟是不是 Proforma 无关。
+            reasons.append("Scanned document read via OCR — figures need manual review")
+        # Per the user's request: a Proforma is treated the same as a regular Tax
+        # Invoice and no longer gets pushed into "needs review" just for being a
+        # Proforma — it already takes part in reconciliation normally (see the
+        # README's "About matched and needs-review" section). This just stops
+        # padding the flag count for that one reason; the signals that should
+        # actually surface it are the amount equation, tax rate, and OCR/AI
+        # source — none of which are about whether it's a Proforma.
         if not inv.get("supplier"):
-            reasons.append("未取到供应商")
+            reasons.append("Supplier not extracted")
 
         if reasons:
             out.append({
-                "发票号": inv.get("invoice_no"), "供应商": inv.get("supplier"),
-                "发票日期": inv.get("invoice_date"), "币种": inv.get("currency"),
-                "合计": total, "疑点数": len(reasons),
-                "需要核查的原因": "；".join(reasons), "文件": inv.get("source_file"),
+                "Invoice No": inv.get("invoice_no"), "Supplier": inv.get("supplier"),
+                "Invoice Date": inv.get("invoice_date"), "Currency": inv.get("currency"),
+                "Total": total, "Flags": len(reasons),
+                "Reason": "; ".join(reasons), "File": inv.get("source_file"),
             })
-    out.sort(key=lambda r: r["疑点数"], reverse=True)
+    out.sort(key=lambda r: r["Flags"], reverse=True)
     return out
 
 
-# OCR 最常混淆的字符对。只在「疑似识别错误」时用来试探，绝不做全文替换。
+# The character pairs OCR confuses most often. Only used to probe "possibly misread" cases — never a blanket text-wide replacement.
 _CONFUSIONS = [("O", "0"), ("I", "1"), ("L", "1"), ("S", "5"),
                ("B", "8"), ("Z", "2"), ("G", "6"), ("Q", "0"), ("D", "0")]
 _CONFUSION_SET = {p for a, b in _CONFUSIONS for p in ((a, b), (b, a))}
 
 
 def suggest_repair(raw, candidates, limit=3):
-    """发票号疑似抽错时，在同供应商的台账号码里找出可能的正确值。
+    """When an invoice number looks like it was mis-extracted, look for a
+    likely correct value among this supplier's ledger numbers.
 
-    两种情形：
-      1) OCR 字符混淆 —— LBHO00 里的 O 其实是数字 0
-      2) 被截断 —— INV-26 其实是 INV-26-03283
+    Two cases:
+      1) OCR character confusion — the O in LBHO00 is actually the digit 0
+      2) Truncation — INV-26 is actually INV-26-03283
 
-    逐位比对而非整串替换：整串替换会把 INV 里的 I 也换成 1，反而破坏号码。
-    只有长度相同、且所有不同的位置都落在混淆字符对里，才算候选。
+    Compares character-by-character rather than doing a blanket substring
+    replace — a blanket replace would also turn the I in INV into a 1 and
+    corrupt the number. A candidate only counts if it's the same length and
+    every differing position falls within a known confusion pair.
 
-    永远只是建议。程序不会据此自动匹配，发票号必须完全相等才算 matched。
+    Always just a suggestion. The program never auto-matches on this basis —
+    the invoice number must match exactly to count as matched.
     """
     if not raw or not candidates:
         return None
     s = str(raw).strip()
 
-    # 情形 1：逐位比对
+    # Case 1: character-by-character comparison
     hits = []
     for c in candidates:
         if c == s or len(c) != len(s):
@@ -271,19 +288,19 @@ def suggest_repair(raw, candidates, limit=3):
         if diff and len(diff) <= 3 and all(pair in _CONFUSION_SET for pair in diff):
             hits.append(c)
     if hits:
-        return "疑似 OCR 字符误识，台账中有 " + " / ".join(sorted(hits)[:limit])
+        return "Possible OCR character misread — the ledger has " + " / ".join(sorted(hits)[:limit])
 
-    # 情形 2：抽到的值是某个台账号码的前缀
+    # Case 2: the extracted value is a prefix of some ledger number
     pre = sorted(c for c in candidates if c != s and c.startswith(s) and len(s) >= 4)
     if pre:
-        tail = " / ".join(pre[:limit]) + ("…" if len(pre) > limit else "")
-        return f"疑似被截断，台账中有 {tail}"
+        tail = " / ".join(pre[:limit]) + ("..." if len(pre) > limit else "")
+        return f"Possibly truncated — the ledger has {tail}"
 
     return None
 
 
 def _shape(v):
-    """把发票号抽象成格式：97809367 -> 99999999 ； INV-0386 -> AAA-9999"""
+    """Abstract an invoice number into a shape: 97809367 -> 99999999 ; INV-0386 -> AAA-9999"""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return ""
     s = str(v).strip()
@@ -293,7 +310,7 @@ def _shape(v):
 
 
 def reconcile(xlsx_path, pdf_source):
-    """pdf_source 可以是文件夹路径，也可以是 pdf 路径列表"""
+    """pdf_source can be a folder path or a list of PDF paths"""
     expected, pending = load_tracking_list(xlsx_path)
 
     if isinstance(pdf_source, (str, os.PathLike)):
@@ -323,20 +340,23 @@ def reconcile(xlsx_path, pdf_source):
         po = normalize_invoice_no(inv.get("po_no"))
         if inv.get("is_proforma") and po and po in po_has_tax:
             superseded.append({
-                "发票号": inv.get("invoice_no"), "PO": inv.get("po_no"),
-                "供应商": inv.get("supplier"),
-                "合计": (inv.get("subtotal") or {}).get("amount_incl"),
-                "忽略原因": "同一 PO 已有 Tax Invoice，按规则只算 Tax Invoice",
-                "文件": inv.get("source_file"),
+                "Invoice No": inv.get("invoice_no"), "PO": inv.get("po_no"),
+                "Supplier": inv.get("supplier"),
+                "Total": (inv.get("subtotal") or {}).get("amount_incl"),
+                "Reason Ignored": "This PO already has a Tax Invoice; by rule only the Tax Invoice is counted",
+                "File": inv.get("source_file"),
             })
             del invoices[key]
 
     matched, discrepancy, pdf_only, excel_only = [], [], [], []
 
-    # 两级匹配。
-    # 台账里 PO 号 59 个、发票号只有 54 个且格式各异，而每张 PDF 的文件名都带 PO，
-    # 所以 PO 才是两边都完整规范的键。发票号仍优先——它更精确、能区分同一 PO 的多张发票；
-    # 发票号对不上时退回 PO，并在 Note 里注明用了哪一级，保持可追溯。
+    # Two-level matching.
+    # The ledger has 59 PO numbers but only 54 invoice numbers in varying formats,
+    # and every PDF's filename carries a PO number, so the PO is the key that's
+    # fully populated and normalized on both sides. Invoice number is still tried
+    # first — it's more precise and can distinguish multiple invoices on the same
+    # PO; when it doesn't match, we fall back to PO and note which level was used
+    # in the Note field, so it stays traceable.
     by_inv, by_po = {}, {}
     for _, r in expected.iterrows():
         if r["invoice_key"]:
@@ -344,10 +364,13 @@ def reconcile(xlsx_path, pdf_source):
         if r["po_key"]:
             by_po.setdefault(r["po_key"], []).append(r)
 
-    # OCR 混淆折叠索引。Tesseract 在发票号上最常见的错认是 O/0、I/l/1、S/5、B/8，
-    # 实测 INV260123-LBH001 被读成 INV260123-LBHOO1 —— 格式合法、校验能过，
-    # 所以 fix_ocr_digits 不触发，精确匹配又对不上，白白掉进「查无此单」。
-    # 折叠后若在台账中唯一命中才认，命中多条则宁可不认，交人工。
+    # OCR-confusion folding index. Tesseract's most common misreads on invoice
+    # numbers are O/0, I/l/1, S/5, B/8 — in practice INV260123-LBH001 gets read
+    # as INV260123-LBHOO1: the format is still valid and passes validation, so
+    # fix_ocr_digits never triggers, and the exact match fails too, so it falls
+    # uselessly into "no ledger match". Folded keys are only accepted when they
+    # hit exactly one ledger entry; multiple hits are left for a human rather
+    # than guessed.
     def _fold(k):
         return (str(k or "").upper().replace("O", "0").replace("I", "1")
                 .replace("L", "1").replace("S", "5").replace("B", "8"))
@@ -357,27 +380,29 @@ def reconcile(xlsx_path, pdf_source):
         folded.setdefault(_fold(k), []).append(k)
 
     used_inv, used_po = set(), set()
-    # 同一 PO 可能对应多张发票（分批开票），先数一下，多张时不能整组认领
+    # The same PO can correspond to multiple invoices (invoiced in batches) — count them first, since a group of more than one can't be claimed as a whole
     po_pdf_count = {}
     for inv in list(invoices.values()) + failed:
         k = normalize_invoice_no(inv.get("po_no"))
         if k:
             po_pdf_count[k] = po_pdf_count.get(k, 0) + 1
 
-    # 没抽到发票号的（多为扫描件）也一并参与：它们的文件名 PO 依然可靠
+    # Invoices with no extracted invoice number (mostly scans) still take part: their filename PO is still reliable
     candidates = list(invoices.items()) + [("", i) for i in failed]
     failed = []
 
-    # ---- 分批开票：同一 PO 多张发票，先加总再比 ----
-    # 逐张比一定不符（每张只是总额的一部分），会把本来正确的账报成异常。
-    # 先按 PO 把这些发票的合计加起来与台账整组比：对得上 -> 整组 matched；
-    # 对不上 -> 退回逐张处理，让人看清楚是哪一张出了问题。
-    batch_ok = {}          # po_key -> 该 PO 下所有发票（已确认加总相符）
+    # ---- Batch invoicing: multiple invoices on the same PO — sum first, then compare ----
+    # Comparing each one individually is guaranteed to mismatch (each is only
+    # part of the total), which would flag an otherwise-correct account as an
+    # error. Instead, sum these invoices per PO and compare against the whole
+    # ledger group: if it matches, the whole group is matched; if not, fall
+    # back to per-invoice handling so a person can see exactly which one is off.
+    batch_ok = {}          # po_key -> all invoices under that PO (confirmed the sum matches)
     _by_po_pdf = {}
     for key, inv in candidates:
         if key and (key in by_inv
                     or (inv.get("ocr") and len(folded.get(_fold(key), [])) == 1)):
-            continue       # 发票号能直接对上的，不走 PO 聚合
+            continue       # Invoices whose number matches directly skip PO aggregation
         pk = normalize_invoice_no(inv.get("po_no"))
         if pk and pk in by_po:
             _by_po_pdf.setdefault(pk, []).append((key, inv))
@@ -387,7 +412,7 @@ def reconcile(xlsx_path, pdf_source):
             continue
         totals = [(i.get("subtotal") or {}).get("amount_incl") for _, i in group]
         if any(t is None for t in totals):
-            continue       # 有一张没抽到合计，加总没有意义
+            continue       # If one invoice's total wasn't extracted, the sum is meaningless
         x_incl = round(pd.DataFrame(by_po[pk])["Amount incl. GST"].sum(), 2)
         if abs(round(sum(totals), 2) - x_incl) <= TOLERANCE:
             batch_ok[pk] = group
@@ -400,22 +425,31 @@ def reconcile(xlsx_path, pdf_source):
             t = (inv.get("subtotal") or {}).get("amount_incl")
             matched.extend(merged_rows(
                 inv, gdf,
-                f"按 PO 号匹配：该 PO 共 {n} 张发票分批开具，"
-                f"合计 {round(sum((i.get('subtotal') or {}).get('amount_incl') for _, i in group), 2)}"
-                f" 与台账一致（本张 {t}）"))
+                f"Matched by PO: this PO has {n} invoices issued in batches, "
+                f"total {round(sum((i.get('subtotal') or {}).get('amount_incl') for _, i in group), 2)}"
+                f" agrees with the ledger (this invoice: {t})"))
     _batched = {id(i) for g in batch_ok.values() for _, i in g}
     candidates = [(k, i) for k, i in candidates if id(i) not in _batched]
 
-    # 同一 PO 下多张发票都没能识别出发票号、加总也对不上台账（上面「分批开票」
-    # 那步失败）：以前这种情况会让每一张都去跟台账里没认领的全部行比总和，
-    # 报出来的差额是「台账整组之和 - 这一张」，既没意义还会连累明明对得上的那张
-    # 也被判成 mismatch（真实案例：同一 PO 两张洗衣发票，其中一张金额和台账某一
-    # 行完全一致，只因为另一张对不上就被一起报错，Note 里的台账合计跟这张发票
-    # 实际对应的那行对不上号，容易让人怀疑是不是台账录错了）。
-    # 张数和台账未认领行数对得上时，改成按金额就近一对一配对：每张发票配它金额
-    # 最接近的那一行台账，再各自判断是否在容差内——这样报出来的差额才是这一张
-    # 真正对应哪一行、差多少。张数对不上（更常见是行数与发票数不等）时不做这个
-    # 配对，退回原来的整组比较，避免瞎猜配错。
+    # Multiple invoices under the same PO where none of them could be matched
+    # by invoice number, and the sum didn't match the ledger either (the
+    # "batch invoicing" step above failed): previously this would compare
+    # every single one against the sum of all unclaimed ledger rows, which
+    # produced a meaningless diff ("ledger group total minus this one
+    # invoice") and dragged an otherwise-correct invoice into mismatch too
+    # (real case: two laundry invoices on the same PO, one of which matched a
+    # ledger row exactly, but got reported as a mismatch anyway just because
+    # the other one didn't match — the ledger total in the Note didn't
+    # correspond to the row this invoice actually matched, which made it look
+    # like the ledger itself might be wrong).
+    # When the invoice count matches the number of unclaimed ledger rows,
+    # pair them by nearest amount instead: each invoice is paired with the
+    # ledger row closest to it in amount, and each pair is then judged
+    # against the tolerance independently — so any reported diff is actually
+    # about the specific row that invoice corresponds to, and by how much.
+    # When the counts don't match (more commonly rows != invoices), skip this
+    # pairing and fall back to the original whole-group comparison, to avoid
+    # guessing a wrong pairing.
     _paired = set()
     for pk, group in _by_po_pdf.items():
         if pk in batch_ok or len(group) < 2:
@@ -428,28 +462,31 @@ def reconcile(xlsx_path, pdf_source):
         remaining_rows = list(rows)
         for _key, inv in sorted(group, key=lambda kv: (kv[1].get("subtotal") or {}).get("amount_incl")):
             p_incl = (inv.get("subtotal") or {}).get("amount_incl")
-            # 注意：rows 里是 pandas Series，list.remove() 靠 == 比较会在多值场景下
-            # 抛 "truth value of a Series is ambiguous"，改成按下标 pop，避免这个坑。
+            # Note: rows are pandas Series — list.remove()'s == comparison
+            # raises "truth value of a Series is ambiguous" when there are
+            # multiple candidates, so we pop by index instead to sidestep that.
             best_idx = min(range(len(remaining_rows)),
                            key=lambda idx: abs(remaining_rows[idx]["Amount incl. GST"] - p_incl))
             best = remaining_rows.pop(best_idx)
             gdf = pd.DataFrame([best])
             x_incl = best["Amount incl. GST"]
-            tag = (f"按金额就近配对（该 PO 下 {len(group)} 张发票均未能识别出发票号，"
-                   f"按合计金额分别配对台账对应行，而非整组合计比较）")
+            tag = (f"Paired by nearest amount (all {len(group)} invoices under this PO had no "
+                   f"recognizable invoice number, so each was paired to its corresponding ledger "
+                   f"row by total amount rather than compared against the whole-group sum)")
             if abs(x_incl - p_incl) <= TOLERANCE:
                 matched.extend(merged_rows(inv, gdf, tag))
             else:
                 diff = round(p_incl - x_incl, 2)
                 discrepancy.extend(merged_rows(
-                    inv, gdf, "；".join([tag, f"金额不符：台账 {x_incl} vs 发票 {p_incl}（差 {diff}）"])))
+                    inv, gdf, "; ".join([tag, f"Amount mismatch: ledger {x_incl} vs invoice {p_incl} (diff {diff})"])))
             _paired.add(id(inv))
         used_po.add(pk)
     candidates = [(k, i) for k, i in candidates if id(i) not in _paired]
 
-    # 预扫一遍：先确定哪些台账行会被发票号直接认领。
-    # 必须放在主循环之前 —— 否则「已认领」取决于遍历顺序，
-    # 同一 PO 的两张发票谁先被处理，结果就不一样。
+    # Pre-scan: figure out up front which ledger rows will be directly claimed
+    # by invoice number. This must happen before the main loop — otherwise
+    # "already claimed" would depend on iteration order, and whichever of two
+    # invoices on the same PO gets processed first would change the outcome.
     claimed_inv = set()
     for _k, _i in candidates:
         if _k and _k in by_inv:
@@ -460,17 +497,21 @@ def reconcile(xlsx_path, pdf_source):
     for key, inv in candidates:
         grp, level = None, None
         if key and key in by_inv:
-            grp, level = by_inv[key], "发票号"
+            grp, level = by_inv[key], "Invoice No"
             used_inv.add(key)
         elif key and inv.get("ocr") and len(folded.get(_fold(key), [])) == 1:
             real = folded[_fold(key)][0]
-            grp, level = by_inv[real], f"发票号（OCR 字符纠正：{key} → {real}，请人工确认）"
+            grp, level = by_inv[real], f"Invoice No (OCR character correction: {key} -> {real}, please confirm manually)"
             used_inv.add(real)
-            # 之前这里只用 real 去台账里取匹配的行，抽取结果本身（inv["invoice_no"]）
-            # 从没改过，导致 outcome.xlsx 和「待核查」里显示的仍是 OCR 读错的原始号码
-            # （比如 LBHOO1），配对成功了但号码本身还是错的，容易被当成没修好。
-            # inv 和 invoices 字典引用的是同一个对象，这里改了后面 flag_suspicious
-            # 用到的也是修正后的号码，格式比对不会再误报「与台账不一致」。
+            # Previously this only used `real` to look up the matching ledger
+            # row — the extraction result itself (inv["invoice_no"]) was never
+            # updated, so outcome.xlsx and "needs review" kept showing the
+            # original OCR-misread number (e.g. LBHOO1): the pairing succeeded
+            # but the displayed number was still wrong, which looked unfixed.
+            # `inv` and the `invoices` dict reference the same object, so
+            # updating it here means flag_suspicious() downstream also sees
+            # the corrected number, and the format check won't falsely flag
+            # "doesn't match the ledger" anymore.
             n = by_inv[real][0]["Invoice Number"]
             fixed_no = (str(int(n)) if isinstance(n, float) and n.is_integer() else str(n).strip()) if n is not None else None
             if fixed_no and normalize_invoice_no(fixed_no) == real:
@@ -478,60 +519,63 @@ def reconcile(xlsx_path, pdf_source):
                 if fixed_no != old_no:
                     inv["invoice_no"] = fixed_no
                     inv.setdefault("warnings", []).append(
-                        f"发票号经 OCR 字符纠正：{old_no} → {fixed_no}（依据台账唯一匹配），请人工确认")
+                        f"Invoice number corrected via OCR: {old_no} -> {fixed_no} (based on a unique ledger match), please confirm manually")
         else:
             pk = normalize_invoice_no(inv.get("po_no"))
             if pk in by_po:
-                # 同一 PO 下的其他发票可能已按发票号认领了对应台账行。
-                # 若仍拿台账整组来比，剩下这张必然对不上（差额正好是别人那份），
-                # 报出来的 "台账 577.7 vs 发票 957.52" 毫无参考价值。
-                # 所以只跟尚未被认领的行比。
+                # Other invoices under the same PO may already have claimed
+                # their matching ledger rows by invoice number. If we still
+                # compared against the whole ledger group, this one would
+                # necessarily mismatch (the diff would just be someone else's
+                # share) — reporting "ledger 577.7 vs invoice 957.52" would be
+                # meaningless. So only compare against rows that aren't
+                # claimed yet.
                 rest = [r for r in by_po[pk]
                         if not r["invoice_key"] or r["invoice_key"] not in claimed_inv]
                 if rest:
                     grp = rest
-                    level = ("PO 号" if len(rest) == len(by_po[pk])
-                             else "PO 号（已扣除同 PO 下按发票号认领的行）")
+                    level = ("PO" if len(rest) == len(by_po[pk])
+                             else "PO (excluding rows already claimed by invoice number under the same PO)")
                 else:
-                    grp, level = by_po[pk], "PO 号（该 PO 台账行已全部被认领，请人工确认）"
+                    grp, level = by_po[pk], "PO (every ledger row under this PO is already claimed, please confirm manually)"
                 used_po.add(pk)
 
         if grp is None:
             po = str(inv.get("po_no") or "")
-            hint = ("PO 为 2025 年，请核对 2025 年度台账"
-                    if re.match(r"PONCG2025", po, re.I) else "台账中查无此 PO 与发票号")
+            hint = ("PO is from 2025 — please check the 2025 ledger"
+                    if re.match(r"PONCG2025", po, re.I) else "No matching PO or invoice number in the ledger")
             pdf_only.extend(pdf_rows(inv, "PDF", hint))
             continue
 
         gdf = pd.DataFrame(grp)
         x_incl = round(gdf["Amount incl. GST"].sum(), 2)
         p_incl = (inv.get("subtotal") or {}).get("amount_incl")
-        tag = "" if level == "发票号" else f"按 {level} 匹配"
+        tag = "" if level == "Invoice No" else f"Matched by {level}"
         if not key and tag:
-            tag += "（发票号未能识别）"
+            tag += " (invoice number not recognized)"
 
         if p_incl is None:
-            discrepancy.extend(merged_rows(inv, gdf, "；".join(x for x in [tag, "未抽到发票合计，无法比对金额"] if x)))
+            discrepancy.extend(merged_rows(inv, gdf, "; ".join(x for x in [tag, "Invoice total not extracted, can't compare amounts"] if x)))
         elif abs(x_incl - p_incl) <= TOLERANCE:
             matched.extend(merged_rows(inv, gdf, tag))
         else:
             diff = round(p_incl - x_incl, 2)
-            note = f"金额不符：台账 {x_incl} vs 发票 {p_incl}（差 {diff}）"
-            discrepancy.extend(merged_rows(inv, gdf, "；".join(x for x in [tag, note] if x)))
+            note = f"Amount mismatch: ledger {x_incl} vs invoice {p_incl} (diff {diff})"
+            discrepancy.extend(merged_rows(inv, gdf, "; ".join(x for x in [tag, note] if x)))
 
-    # 台账有、但没找到对应 PDF 的
+    # In the ledger, but no matching PDF was found
     from excel_loader import STATUS_INVOICE_EXPECTED
     still_pending = []
     for _, r in expected.iterrows():
         if r["invoice_key"] in used_inv or r["po_key"] in used_po:
             continue
         if r["_status"] not in STATUS_INVOICE_EXPECTED:
-            still_pending.append(r)          # 货未到，本就不该有发票
+            still_pending.append(r)          # Goods not received yet, so there shouldn't be an invoice yet
         else:
-            excel_only.extend(excel_rows(pd.DataFrame([r]), "台账已记录，但未找到对应发票 PDF"))
+            excel_only.extend(excel_rows(pd.DataFrame([r]), "Recorded in the ledger, but no matching invoice PDF was found"))
 
     for inv in failed:
-        pdf_only.extend(pdf_rows(inv, "PDF", "未能抽出发票号：" + "；".join(inv["warnings"])))
+        pdf_only.extend(pdf_rows(inv, "PDF", "Could not extract an invoice number: " + "; ".join(inv["warnings"])))
 
     sheets = {
         "matched": matched,
@@ -571,8 +615,8 @@ def write_output(sheets, pending, path, suspicious=None, superseded=None):
             ws.column_dimensions[L].width = 34 if OUT_COLS[col-1] in ("Description", "Note") else 17
         ws.freeze_panes = "A2"
 
-    ws = wb.create_sheet("已忽略的 Proforma")
-    cols2 = ["发票号", "PO", "供应商", "合计", "忽略原因", "文件"]
+    ws = wb.create_sheet("Ignored Proformas")
+    cols2 = ["Invoice No", "PO", "Supplier", "Total", "Reason Ignored", "File"]
     ws.append(cols2)
     for c in ws[1]:
         c.font = Font(name="Arial", bold=True)
@@ -582,8 +626,8 @@ def write_output(sheets, pending, path, suspicious=None, superseded=None):
         ws.column_dimensions[L].width = 46 if L in "EF" else 18
     ws.freeze_panes = "A2"
 
-    ws = wb.create_sheet("待核查")
-    cols = ["发票号", "供应商", "发票日期", "币种", "合计", "疑点数", "需要核查的原因", "文件"]
+    ws = wb.create_sheet("Needs Review")
+    cols = ["Invoice No", "Supplier", "Invoice Date", "Currency", "Total", "Flags", "Reason", "File"]
     ws.append(cols)
     for c in ws[1]:
         c.font = Font(name="Arial", bold=True)
@@ -614,8 +658,8 @@ if __name__ == "__main__":
     sheets, pending, ctx = reconcile(xlsx, pdf_dir)
     write_output(sheets, pending, out, ctx["suspicious"], ctx["superseded"])
     for k, v in sheets.items():
-        print(f"{k:28s} {len(v):4d} 行")
-    print(f"{'已忽略 Proforma':25s} {len(ctx['superseded']):4d} 张")
-    print(f"{'待核查':29s} {len(ctx['suspicious']):4d} 张")
-    print(f"{'pending (未开票)':26s} {len(pending):4d} 行")
-    print("已写出:", out)
+        print(f"{k:28s} {len(v):4d} rows")
+    print(f"{'Ignored Proformas':25s} {len(ctx['superseded']):4d}")
+    print(f"{'Needs Review':29s} {len(ctx['suspicious']):4d}")
+    print(f"{'pending (not invoiced)':26s} {len(pending):4d} rows")
+    print("Written to:", out)

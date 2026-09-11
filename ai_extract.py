@@ -1,17 +1,20 @@
-__version__ = "2026-09-11.5"
+__version__ = "2026-09-11.7"
 
 """
-ai_extract.py — 用视觉模型读发票（仅用于正则和 OCR 都拿不下的那批）
+ai_extract.py — reads invoices with a vision model (only for the ones that regex and OCR can't handle)
 
-调用策略：原生 PDF 走正则，又快又准且不花钱；只有扫描件、或正则抽不到发票号的
-才发给模型。60 张发票里通常只有不到 10 张真正发出去。
+Call strategy: native-text PDFs go through regex — fast, accurate, and free;
+only scanned documents, or ones where regex couldn't extract an invoice
+number, get sent to the model. Out of 60 invoices, usually fewer than 10
+actually get sent.
 
-模型只负责「读」，不负责「判断」：它按固定 schema 吐字段，匹配、金额校验、
-去重仍由确定性代码完成。财务对账不能让模型下结论。
+The model only "reads" — it doesn't "judge": it emits fields according to a
+fixed schema, and matching, amount validation, and de-duplication are still
+handled by deterministic code. Financial reconciliation can't let a model draw conclusions.
 
-Key 放同目录 .env：
+The key lives in a .env file in the same directory:
     ANTHROPIC_API_KEY=sk-ant-xxxx
-.env 不要提交、不要随脚本分发。
+Don't commit .env, and don't distribute it with the scripts.
 """
 
 import base64
@@ -19,8 +22,8 @@ import json
 import os
 import re
 
-MODEL = "claude-sonnet-5"      # 想更省可换 claude-haiku-4-5-20251001
-MAX_PAGES = 3                  # 发票正文通常在前几页，后面多是条款和汇款信息
+MODEL = "claude-sonnet-5"      # switch to claude-haiku-4-5-20251001 for lower cost
+MAX_PAGES = 3                  # the invoice body is usually on the first few pages; later pages are mostly terms and remittance info
 DPI = 200
 
 _client = None
@@ -58,7 +61,7 @@ Rules:
 
 
 def _load_env():
-    """读同目录 .env。用最朴素的解析，不引入额外依赖。"""
+    """Read the .env file in the same directory, with the simplest possible parsing and no extra dependencies."""
     if os.environ.get("ANTHROPIC_API_KEY"):
         return os.environ["ANTHROPIC_API_KEY"]
     for d in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
@@ -75,7 +78,7 @@ def _load_env():
 
 
 def available():
-    """有 key 且 SDK 装好了才算可用。不可用时上层应跳过而非报错。"""
+    """Only available when there's a key and the SDK is installed. When unavailable, callers should skip it rather than error out."""
     try:
         import anthropic          # noqa: F401
     except ImportError:
@@ -95,7 +98,7 @@ def _pages_as_png(path, max_pages=MAX_PAGES):
 
 
 def _parse_json(text):
-    """模型偶尔会裹 ``` 或加一句前言，这里做容错。"""
+    """The model occasionally wraps the output in ``` fences or adds a lead-in sentence — this tolerates both."""
     t = text.strip()
     t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t)
     try:
@@ -111,7 +114,7 @@ def _parse_json(text):
 
 
 def extract(path, filename_hint=""):
-    """返回与 invoice_extractor 同构的字段字典；失败返回 None。"""
+    """Returns a field dict shaped the same way as invoice_extractor's; returns None on failure."""
     global _client
     if not available():
         return None
@@ -145,9 +148,9 @@ def extract(path, filename_hint=""):
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
     data = _parse_json(text)
     if not data:
-        return {"_error": "模型返回的不是合法 JSON"}
+        return {"_error": "Model did not return valid JSON"}
 
-    # 模型可能把税率当税额，或三个金额对不上 —— 用等式兜一道
+    # The model might mistake the tax rate for the tax amount, or the three amounts might not agree — the equation catches that
     e, g, i = (data.get("amount_excl_gst"), data.get("gst"), data.get("amount_incl_gst"))
     if None not in (e, g, i) and abs(e + g - i) > 0.05:
         data["gst"] = round(i - e, 2)

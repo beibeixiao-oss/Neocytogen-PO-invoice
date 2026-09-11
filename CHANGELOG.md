@@ -1,6 +1,41 @@
-# 更新说明 · 2026-09-11.5
+# 更新说明 · 2026-09-11.7
 
 请把整个目录（全部 .py 文件）覆盖，版本号必须一致，否则界面会报「文件版本不一致」。
+
+## 2026-09-11.7：彻底清掉了界面上剩下的中文——「待核查」列表、Note、告警文字全部改成英文
+
+上一轮（2026-09-11.6）只翻了 `app.py` 自己写的文字，留了一个尾巴：待核查列表的字段名、Note 里的具体原因、提取告警文字，其实是 `reconcile.py`/`invoice_extractor.py`/`ocr.py`/`ai_extract.py` 这几个后端文件生成出来的中文字符串，app.py 只是原样显示。这轮把这几个文件也都翻了，加上 `excel_loader.py`、`diagnose.py`、`README.md`，整个交付包（除了这份 CHANGELOG 和项目文档本身）不再有中文。
+
+### 改了什么
+
+1. **`reconcile.py`**：`flag_suspicious()` 返回的 dict 键名和值——原来是「发票号」「供应商」「发票日期」「币种」「合计」「疑点数」「需要核查的原因」「文件」这类中文键，现在是 `Invoice No`/`Supplier`/`Invoice Date`/`Currency`/`Total`/`Flags`/`Reason`/`File`；`需要核查的原因`里具体的疑点描述（"未取到发票合计""金额与该供应商中位数相差十倍以上""税率异常"等）也都翻了。`write_output()` 写出的「已忽略的 Proforma」「待核查」两个 sheet 名和列头，改成了「Ignored Proformas」「Needs Review」和对应的英文列头。所有 Note 字段里的说明文字（"按 PO 号匹配""金额不符：台账 X vs 发票 Y""台账已记录，但未找到对应发票 PDF"等）都翻成了英文，同时保留原有逻辑完全不变。因为改了 `flag_suspicious()` 的返回键名，`app.py` 里"待核查"板块读取这些字段的地方（`row.get('发票号')` 等）也同步改成了读取新的英文键（`row.get('Invoice No')` 等），不然界面会直接读不到值。
+2. **`invoice_extractor.py`**：所有 `warnings` 列表里塞的提示文字（"扫描件，内容由 OCR 识别——数字可能有误，请人工复核""发票号取自文件名""行加总与发票合计不符"等）全部翻成英文——这些文字会出现在界面的「提取告警」板块，也会被写进 Note 字段里。翻译时特意核对了代码里两处依赖这段文字做字符串匹配的逻辑（判断"日期是不是取自文件名的猜测值"），确保英文提示词翻译后这两处匹配仍然对得上，不会因为翻译就失效。
+3. **`ocr.py` / `ai_extract.py` / `excel_loader.py`**：函数说明、注释、内部提示信息全部翻成英文（这几个文件本身没有直接面向界面的中文字符串，主要是代码内部文档）。
+4. **`diagnose.py` / `README.md`**：命令行调试工具的输出文字和项目说明文档也顺带翻了，交付包里不再有遗留的中文。
+
+### 测试方法
+
+用跟上两轮相同的方法验证：`streamlit.testing.v1.AppTest` + reportlab 生成的假发票/假台账（这次特意加了一张税率异常的发票，确保会触发「待核查」），跑一遍「上传 → Run Reconciliation → 待核查板块正常渲染（验证新的英文键名读取无误）→ 点 Verified 移除 → discrepancy 编辑并 Confirm & move to matched → No Ledger Match 里 Manually add to matched」的完整流程，全部断言通过；另外单独跑了一遍 `write_output()`，确认导出的 outcome.xlsx 里「Needs Review」「Ignored Proformas」两个 sheet 名和列头也都是英文。`python3 -m py_compile` 确认全部 7 个 .py 文件（含 diagnose.py）都能正常编译。用脚本扫描全部 `.py` 文件，确认不再有任何一行包含中文字符。
+
+版本号统一改为 `2026-09-11.7`。
+
+## 2026-09-11.6：app.py 界面文字全部改成英文
+
+用户要求把 `app.py`（界面层）里的中文全部换成英文，只改这一个文件——匹配/抽取逻辑完全没动，其余 5 个文件只是同步了版本号。
+
+### 改了什么
+
+`app.py` 里所有的中文都换成了英文：页面标题、按钮、说明文字（caption/info/warning/success/error）、5 个统计指标的标签、文件上传提示、下拉框、代码里的函数说明和注释、以及各个 tab 的名字（中文 tab 名换成了对应的英文：「台账查无此单」→「No Ledger Match」，「台账有单缺发票」→「No Invoice Found」，「未开票」→「Not Yet Invoiced」；「To Import to Xero」/「matched」/「discrepancy」本来就是英文，没动）。按钮上的文字也都翻了，比如「开始对账」→「Run Reconciliation」，「确认并移到 matched」→「Confirm & move to matched」，「手动加入 matched」→「Manually add to matched」，「已核实」→「Verified」。
+
+### 有一点需要留意：还有几处中文不在 app.py 里，这次没有覆盖到
+
+「待核查」那个板块里每一条显示的内容（发票号、供应商、合计、疑点原因等），来自 `reconcile.py` 的 `flag_suspicious()` 函数——这个函数返回的 dict 本身用的就是中文键名（比如 `发票号`、`供应商`、`需要核查的原因`），app.py 只是把这些值原样显示出来。另外，「提取告警」和各个 tab 里 Note 那一栏显示的具体原因文字，也是从 `reconcile.py`/`invoice_extractor.py`/`ocr.py` 里生成的中文字符串，app.py 只是转述。这次用户说的是"app 里的中文"，所以只动了 `app.py` 自己的文字，这几处没有一起翻——如果想要整个界面完全没有中文（包括待核查列表和各种提示原因），需要另外改这三个后端文件，我可以下一轮再做。
+
+### 测试方法
+
+用跟 2026-09-11.5 同一套方法验证：`streamlit.testing.v1.AppTest` + reportlab 生成的假发票/假台账，跑一遍「上传 → 点 Run Reconciliation → discrepancy 编辑并点 Confirm & move to matched → No Ledger Match 里点 Manually add to matched」的完整流程，确认翻译成英文后按钮和逻辑照常工作、数据在各个列表间正确搬动，全部断言通过。`python3 -m py_compile` 确认 6 个文件都能正常编译。
+
+版本号统一改为 `2026-09-11.6`。
 
 ## 2026-09-11.5：界面加了「To Import to Xero」和手动核对/移动功能
 
